@@ -25,7 +25,7 @@ import { buildGraphModel, type GraphEdgeData } from "./graphModel";
 import { ForwardingSimulator } from "./ForwardingSimulator";
 import { Inspector } from "./Inspector";
 import { emptyGraphSelection, shouldShowHoveredNode, updateGraphBoxSelection, updateGraphSelection } from "./selectionModel";
-import { TopologyCanvas, type SimulationCanvasState, type TopologyCanvasHandle } from "./TopologyCanvas";
+import { TopologyCanvas, type SimulationCanvasState, type SimulationDevice, type TopologyCanvasHandle } from "./TopologyCanvas";
 
 const roleLabels: Record<DeviceRole, string> = {
   CSW: "核心 CSW",
@@ -101,6 +101,10 @@ export default function App() {
   const [forwardingOpen, setForwardingOpen] = useState(false);
   const [simulationCanvas, setSimulationCanvas] = useState<SimulationCanvasState>();
   const [simulationNodeIds, setSimulationNodeIds] = useState<ReadonlySet<string>>(new Set());
+  const [simulationDevice, setSimulationDevice] = useState<SimulationDevice>();
+  const [simulationDeviceTargetId, setSimulationDeviceTargetId] = useState<string>();
+  const [simulationSourceIp, setSimulationSourceIp] = useState("");
+  const [simulationSourceError, setSimulationSourceError] = useState<string>();
   const clearHoverTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const canvasRef = useRef<TopologyCanvasHandle>(null);
   const layoutChangeVersion = useRef(0);
@@ -126,6 +130,8 @@ export default function App() {
       setLayoutDirty(false);
       setSimulationCanvas(undefined);
       setSimulationNodeIds(new Set());
+      setSimulationDevice(undefined);
+      setSimulationDeviceTargetId(undefined);
     } catch (loadError) {
       setError(loadError instanceof Error ? loadError.message : "无法读取拓扑数据");
     } finally {
@@ -154,9 +160,13 @@ export default function App() {
     void initialize();
   }, [loadTopology]);
 
+  const visibleSimulationNodeIds = useMemo(() => new Set([
+    ...simulationNodeIds,
+    ...(simulationDevice ? [simulationDevice.deviceId] : []),
+  ]), [simulationDevice, simulationNodeIds]);
   const model = useMemo(
-    () => snapshot ? buildGraphModel(snapshot, { query, pods, roles, planes, expandedClusters, selectedNodeIds: selection.nodeIds, gpuSourceNodeIds: gpuSourceIds, visibleGpuPods, simulationNodeIds }) : undefined,
-    [expandedClusters, gpuSourceIds, planes, pods, query, roles, selection.nodeIds, simulationNodeIds, snapshot, visibleGpuPods],
+    () => snapshot ? buildGraphModel(snapshot, { query, pods, roles, planes, expandedClusters, selectedNodeIds: selection.nodeIds, gpuSourceNodeIds: gpuSourceIds, visibleGpuPods, simulationNodeIds: visibleSimulationNodeIds }) : undefined,
+    [expandedClusters, gpuSourceIds, planes, pods, query, roles, selection.nodeIds, snapshot, visibleGpuPods, visibleSimulationNodeIds],
   );
   const graphNodeById = useMemo(() => new Map(model?.nodes.map((node) => [node.id, node]) ?? []), [model]);
   const nodeById = useMemo(() => new Map(snapshot?.nodes.map((node) => [node.id, node]) ?? []), [snapshot]);
@@ -418,6 +428,32 @@ export default function App() {
     setSimulationNodeIds(nodeIds);
   }, []);
 
+  const openSimulationDevice = useCallback((deviceId: string) => {
+    setSimulationDeviceTargetId(deviceId);
+    setSimulationSourceIp(simulationDevice?.deviceId === deviceId ? simulationDevice.sourceIp : "");
+    setSimulationSourceError(undefined);
+  }, [simulationDevice]);
+
+  const saveSimulationDevice = useCallback(() => {
+    const parts = simulationSourceIp.split(".");
+    const valid = parts.length === 4 && parts.every((part) => /^\d{1,3}$/.test(part) && Number(part) <= 255);
+    if (!simulationDeviceTargetId || !valid) {
+      setSimulationSourceError("请输入有效的源 IPv4 地址");
+      return;
+    }
+    setSimulationDevice({ deviceId: simulationDeviceTargetId, sourceIp: simulationSourceIp });
+    setSimulationDeviceTargetId(undefined);
+    setSimulationSourceError(undefined);
+  }, [simulationDeviceTargetId, simulationSourceIp]);
+
+  const exitSimulation = useCallback(() => {
+    setForwardingOpen(false);
+    setSimulationCanvas(undefined);
+    setSimulationNodeIds(new Set());
+    setSimulationDevice(undefined);
+    setSimulationDeviceTargetId(undefined);
+  }, []);
+
   if (!snapshot && refreshing) {
     return (
       <main className="loading-screen">
@@ -451,7 +487,15 @@ export default function App() {
           <button className="primary-button" type="button" disabled={refreshing} onClick={() => activeProjectId && activeTopologyId && void loadTopology(activeProjectId, activeTopologyId, true)}>
             <RefreshCw size={15} className={refreshing ? "spin" : ""} />{refreshing ? "正在刷新" : snapshot.sourceType === "ports-csv" ? "重新载入" : "刷新配置"}
           </button>
-          <button className={forwardingOpen ? "simulation-button active" : "simulation-button"} type="button" onClick={() => setForwardingOpen((value) => !value)}><Route size={15} />流量仿真</button>
+          <button className={forwardingOpen ? "simulation-button active" : "simulation-button"} type="button" aria-pressed={forwardingOpen} onClick={() => {
+            if (forwardingOpen) return;
+            setSelection(emptyGraphSelection());
+            setGpuSourceIds(new Set());
+            setPinnedId(undefined);
+            setHoveredId(undefined);
+            setSelectedEdge(undefined);
+            setForwardingOpen(true);
+          }}><Route size={15} />{forwardingOpen ? "仿真模式已开启" : "流量仿真"}</button>
         </div>
       </header>
 
@@ -472,7 +516,7 @@ export default function App() {
         </details>
       )}
 
-      <section className={filtersOpen ? "main-workspace" : "main-workspace sidebar-closed"}>
+      <section className={`main-workspace${filtersOpen ? "" : " sidebar-closed"}${forwardingOpen ? " simulation-open" : ""}`}>
         <aside className="sidebar">
           <section className="catalog-panel" aria-label="项目与拓扑">
             <div className="catalog-heading"><span><Network size={14} />项目拓扑</span><button type="button" onClick={() => void createProject()} title="新增项目" aria-label="新增项目"><FolderPlus size={14} /></button></div>
@@ -561,13 +605,16 @@ export default function App() {
               onClusterToggle={handleClusterToggle}
               onEdgeSelect={handleEdgeSelect}
               simulation={simulationCanvas}
+              simulationMode={forwardingOpen}
+              simulationDevice={simulationDevice}
+              onSimulationDeviceRequest={openSimulationDevice}
             />
           ) : (
             <div className="empty-graph"><Search size={24} /><h2>没有匹配的设备</h2><p>调整搜索条件或重新启用筛选项。</p></div>
           )}
           <div className="canvas-legend"><span><i className="legend-device" />{snapshot.sourceType === "ports-csv" ? "网络设备" : "配置设备"}</span><span><i className="legend-endpoint" />{snapshot.sourceType === "ports-csv" ? "服务器" : "外部终端"}</span><span><i className="legend-cluster" />折叠终端簇</span></div>
-          <div className="canvas-help">普通点击单选 · Ctrl 点击追加 · Alt 拖拽框选后可批量移动</div>
-          <Inspector
+          <div className="canvas-help">{forwardingOpen ? "仿真模式 · 右键任意设备创建模拟设备" : "普通点击单选 · Ctrl 点击追加 · Alt 拖拽框选后可批量移动"}</div>
+          {!forwardingOpen && <Inspector
             graphNode={inspectedNode}
             edge={selectedEdge}
             nodeById={nodeById as Map<string, TopologyNode>}
@@ -578,14 +625,15 @@ export default function App() {
             onClose={() => { setSelection(emptyGraphSelection()); setGpuSourceIds(new Set()); setPinnedId(undefined); setHoveredId(undefined); setSelectedEdge(undefined); }}
             onMouseEnter={keepInspector}
             onMouseLeave={leaveInspector}
-          />
+          />}
           {forwardingOpen && activeProjectId && activeTopologyId && (
             <ForwardingSimulator
-              key={`${activeProjectId}:${activeTopologyId}`}
+              key={`${activeProjectId}:${activeTopologyId}:${simulationDevice?.deviceId ?? ""}:${simulationDevice?.sourceIp ?? ""}`}
               projectId={activeProjectId}
               topologyId={activeTopologyId}
               topology={snapshot}
-              onClose={() => { setForwardingOpen(false); setSimulationCanvas(undefined); setSimulationNodeIds(new Set()); }}
+              simulationDevice={simulationDevice}
+              onClose={exitSimulation}
               onSimulationChange={handleSimulationChange}
             />
           )}
@@ -624,6 +672,20 @@ export default function App() {
               <button className="primary-button" type="button" disabled={importing || !importFile || !importName.trim()} onClick={() => void importTopology()}>{importing ? <RefreshCw className="spin" size={14} /> : <FileUp size={14} />}{importing ? "正在解析" : "导入并打开"}</button>
             </div>
           </section>
+        </div>
+      )}
+      {simulationDeviceTargetId && (
+        <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setSimulationDeviceTargetId(undefined); }}>
+          <form className="simulation-device-modal" role="dialog" aria-modal="true" aria-labelledby="simulation-device-title" onSubmit={(event) => { event.preventDefault(); saveSimulationDevice(); }}>
+            <div className="import-heading">
+              <div><p>模拟设备</p><h2 id="simulation-device-title">创建流量源</h2></div>
+              <button type="button" onClick={() => setSimulationDeviceTargetId(undefined)} aria-label="关闭创建模拟设备窗口"><X size={17} /></button>
+            </div>
+            <p className="import-description">挂载到 <b>{nodeById.get(simulationDeviceTargetId)?.hostname}</b>。源 IP 是本次模拟流量进入该设备时使用的地址。</p>
+            <label className="simulation-source-field"><span>源 IPv4</span><input value={simulationSourceIp} onChange={(event) => { setSimulationSourceIp(event.target.value.trim()); setSimulationSourceError(undefined); }} placeholder="例如：10.0.0.1" /></label>
+            {simulationSourceError && <div className="forwarding-error"><AlertTriangle size={14} />{simulationSourceError}</div>}
+            <div className="import-actions"><button type="button" onClick={() => setSimulationDeviceTargetId(undefined)}>取消</button><button className="primary-button" type="submit">创建模拟设备</button></div>
+          </form>
         </div>
       )}
     </main>

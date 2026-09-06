@@ -89,9 +89,9 @@ export function traceForwarding(topologyId, snapshotId, topology, data, request)
         state.summary = message;
         endpoints.push({ stateId, deviceId, code, message });
     };
-    const evidence = (stateId, sheet, row, description) => {
+    const evidence = (stateId, sheet, row, description, sourceFile) => {
         const state = states.find((item) => item.id === stateId);
-        state.evidence = [...(state.evidence ?? []), { sheet, row, description }];
+        state.evidence = [...(state.evidence ?? []), { sourceFile, sheet, row, description }];
     };
     const interfaceAttribute = (deviceId, interfaceName) => data.interfaces.find((item) => item.deviceId === deviceId && norm(item.interfaceName) === norm(interfaceName));
     const physicalExits = (deviceId, interfaceName) => {
@@ -166,7 +166,7 @@ export function traceForwarding(topologyId, snapshotId, topology, data, request)
         const state = states.find((entry) => entry.id === item.stateId);
         state.kind = "encapsulate";
         state.packet = packetCopy(packet);
-        evidence(item.stateId, origin.sheet, origin.row, `${mode.toUpperCase()}VNI ${mapping.vni} 封装到 ${remoteVtep}`);
+        evidence(item.stateId, origin.sheet, origin.row, `${mode.toUpperCase()}VNI ${mapping.vni} 封装到 ${remoteVtep}`, origin.sourceFile);
         const underlay = routeCandidates(data, item.work.deviceId, mapping.underlayVrf, remoteVtep);
         if (underlay.length === 0) {
             terminate(item.stateId, item.work.deviceId, "VTEP_UNREACHABLE", `Underlay VRF ${mapping.underlayVrf} 中没有到远端 VTEP ${remoteVtep} 的路由`);
@@ -181,7 +181,7 @@ export function traceForwarding(topologyId, snapshotId, topology, data, request)
             terminate(item.stateId, item.work.deviceId, "NO_MAC", `VLAN ${vlan} 中没有目的 MAC ${mac} 的已知单播表项`);
             return;
         }
-        evidence(item.stateId, "MAC表", entry.row, `VLAN ${vlan} 的 ${mac} 命中 ${entry.action}`);
+        evidence(item.stateId, "MAC表", entry.row, `VLAN ${vlan} 的 ${mac} 命中 ${entry.action}`, entry.sourceFile);
         if (entry.action === "drop") {
             terminate(item.stateId, item.work.deviceId, "EXPLICIT_DROP", `MAC 表显式丢弃 ${mac}`);
             return;
@@ -192,7 +192,7 @@ export function traceForwarding(topologyId, snapshotId, topology, data, request)
                 terminate(item.stateId, item.work.deviceId, "NO_VXLAN", `缺少 VLAN ${vlan} 对应的 L2VNI 映射`);
                 return;
             }
-            encapsulate(item, mapping, "l2", entry.remoteVtep, mac, { sheet: "MAC表", row: entry.row });
+            encapsulate(item, mapping, "l2", entry.remoteVtep, mac, { sheet: "MAC表", row: entry.row, sourceFile: entry.sourceFile });
             return;
         }
         if (!entry.outputInterface) {
@@ -202,7 +202,7 @@ export function traceForwarding(topologyId, snapshotId, topology, data, request)
         enqueueExit(item, entry.outputInterface, { ...packetCopy(packet), vlan }, mac, `MAC ${mac} 从 ${entry.outputInterface} 转发`);
     };
     function forwardRoute(item, route, packet, destinationMac, outerLookup) {
-        evidence(item.stateId, "路由表", route.row, `${route.vrf} 中 ${route.destinationCidr} 命中 ${route.action}${route.ecmpGroup ? `（ECMP ${route.ecmpGroup}）` : ""}`);
+        evidence(item.stateId, "路由表", route.row, `${route.vrf} 中 ${route.destinationCidr} 命中 ${route.action}${route.ecmpGroup ? `（ECMP ${route.ecmpGroup}）` : ""}`, route.sourceFile);
         if (route.action === "drop") {
             terminate(item.stateId, item.work.deviceId, "EXPLICIT_DROP", `路由 ${route.destinationCidr} 显式丢弃`);
             return;
@@ -224,7 +224,7 @@ export function traceForwarding(topologyId, snapshotId, topology, data, request)
                 terminate(item.stateId, item.work.deviceId, "NO_VXLAN", `路由引用的 L3VNI ${route.vni ?? "(空)"} 不可用`);
                 return;
             }
-            encapsulate(item, mapping, "l3", route.remoteVtep, destinationMac, { sheet: "路由表", row: route.row });
+            encapsulate(item, mapping, "l3", route.remoteVtep, destinationMac, { sheet: "路由表", row: route.row, sourceFile: route.sourceFile });
             return;
         }
         if (!route.outputInterface) {
@@ -237,7 +237,7 @@ export function traceForwarding(topologyId, snapshotId, topology, data, request)
             terminate(item.stateId, item.work.deviceId, "NO_ARP", `${route.vrf} 中缺少下一跳 ${targetIp} 的可用 ARP`);
             return;
         }
-        evidence(item.stateId, "ARP表", arp.row, `${targetIp} 解析为 ${arp.mac}`);
+        evidence(item.stateId, "ARP表", arp.row, `${targetIp} 解析为 ${arp.mac}`, arp.sourceFile);
         const outputAttribute = interfaceAttribute(item.work.deviceId, route.outputInterface);
         const routedEgress = outputAttribute?.forwardingMode === "routed";
         if (routedEgress) {
@@ -272,7 +272,7 @@ export function traceForwarding(topologyId, snapshotId, topology, data, request)
             const outer = packetAtDevice.vxlan;
             const local = data.vxlanEntries.find((entry) => entry.deviceId === item.work.deviceId && entry.vni === outer.vni && entry.localVtep === outer.outerDestinationVtep && entry.mode === outer.mode && entry.status === "up");
             if (local) {
-                evidence(item.stateId, "VXLAN", local.row, `终结 ${outer.mode.toUpperCase()}VNI ${outer.vni}`);
+                evidence(item.stateId, "VXLAN", local.row, `终结 ${outer.mode.toUpperCase()}VNI ${outer.vni}`, local.sourceFile);
                 publicState.kind = "decapsulate";
                 publicState.summary = `${outer.outerDestinationVtep} 解封装 ${outer.mode.toUpperCase()}VNI ${outer.vni}`;
                 packetAtDevice = { ...packetAtDevice, vxlan: undefined, vrf: local.mode === "l3" ? local.tenantVrf : packetAtDevice.vrf, vlan: local.mode === "l2" ? local.vlan : undefined };
@@ -282,7 +282,7 @@ export function traceForwarding(topologyId, snapshotId, topology, data, request)
                         const arp = data.arpEntries.find((entry) => entry.deviceId === item.work.deviceId && entry.ip === packetAtDevice.innerDestinationIp && entry.status !== "incomplete");
                         destinationMac = arp?.mac;
                         if (arp)
-                            evidence(item.stateId, "ARP表", arp.row, `${arp.ip} 解析为 ${arp.mac}`);
+                            evidence(item.stateId, "ARP表", arp.row, `${arp.ip} 解析为 ${arp.mac}`, arp.sourceFile);
                     }
                     if (!destinationMac || local.vlan === undefined)
                         terminate(item.stateId, item.work.deviceId, destinationMac ? "NO_VXLAN" : "NO_ARP", destinationMac ? "L2VNI 缺少 VLAN 映射" : `解封装后缺少 ${packetAtDevice.innerDestinationIp} 的 ARP`);

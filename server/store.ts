@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import type { ForwardingSnapshotSummary, ForwardingTraceRequest, ForwardingTraceResult } from "../shared/forwarding.js";
 import type { InterfaceRecord, TopologyPosition, TopologyProject, TopologySnapshot } from "../shared/topology.js";
 import { traceForwarding } from "./forwardingEngine.js";
-import { parseForwardingWorkbook } from "./forwardingWorkbookParser.js";
+import { parseForwardingWorkbook, parseForwardingWorkbooks, type ForwardingWorkbookInput } from "./forwardingWorkbookParser.js";
 import { applyServerInventory, loadServerInventory } from "./inventory.js";
 import { parseConfigDirectory } from "./parser.js";
 import { inferImportedRole, parsePortsCsv, parsePortsXlsx } from "./portsCsvParser.js";
@@ -203,6 +203,12 @@ export class TopologyStore {
   async importForwardingSnapshot(projectId: string, topologyId: string, xlsxBytes: Buffer): Promise<ForwardingSnapshotSummary> {
     const topology = this.topology(projectId, topologyId);
     const data = await parseForwardingWorkbook(xlsxBytes, topology);
+    return this.addressStore.saveForwardingSnapshot(topologyId, topologyStructureFingerprint(topology), data);
+  }
+
+  async importForwardingSnapshotBatch(projectId: string, topologyId: string, workbooks: ForwardingWorkbookInput[]): Promise<ForwardingSnapshotSummary> {
+    const topology = this.topology(projectId, topologyId);
+    const data = await parseForwardingWorkbooks(workbooks, topology);
     return this.addressStore.saveForwardingSnapshot(topologyId, topologyStructureFingerprint(topology), data);
   }
 

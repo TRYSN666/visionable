@@ -1,5 +1,5 @@
 import cytoscape, { type Core, type EventObject } from "cytoscape";
-import { forwardRef, useEffect, useImperativeHandle, useRef, useState, type KeyboardEvent, type PointerEvent as ReactPointerEvent } from "react";
+import { forwardRef, useEffect, useImperativeHandle, useRef, useState, type KeyboardEvent, type MouseEvent as ReactMouseEvent, type PointerEvent as ReactPointerEvent } from "react";
 import type { ForwardingTraceResult } from "../shared/forwarding";
 import { edgeIsHighlighted, type GraphEdgeData, type GraphModel, type GraphNodeData } from "./graphModel";
 
@@ -22,6 +22,14 @@ interface TopologyCanvasProps {
   onClusterToggle: (id: string) => void;
   onEdgeSelect: (edge?: GraphEdgeData, additive?: boolean) => void;
   simulation?: SimulationCanvasState;
+  simulationMode?: boolean;
+  simulationDevice?: SimulationDevice;
+  onSimulationDeviceRequest?: (deviceId: string) => void;
+}
+
+export interface SimulationDevice {
+  deviceId: string;
+  sourceIp: string;
 }
 
 export interface SimulationCanvasState {
@@ -162,6 +170,28 @@ const stylesheet = [
       "z-index": 100,
     },
   },
+  {
+    selector: 'node[kind = "simulation-device"]',
+    style: {
+      shape: "round-rectangle",
+      width: 74,
+      height: 27,
+      "background-color": "#fff1f3",
+      "border-color": "#ef233c",
+      "border-width": 2,
+      color: "#a9192d",
+      label: "data(label)",
+      "font-family": "ui-monospace, Consolas, monospace",
+      "font-size": 8,
+      "text-valign": "center",
+      "text-margin-y": 0,
+      "z-index": 90,
+    },
+  },
+  {
+    selector: "edge.simulation-device-edge",
+    style: { "line-color": "#ef8795", "line-style": "dashed", width: 2, opacity: 0.9, label: "", "z-index": 70 },
+  },
 ] as unknown as cytoscape.StylesheetJson;
 
 export function viewportUpdateMode(hasInitializedViewport: boolean): "fit" | "preserve" {
@@ -194,7 +224,7 @@ export function packetPosition(start: { x: number; y: number }, end: { x: number
 }
 
 export const TopologyCanvas = forwardRef<TopologyCanvasHandle, TopologyCanvasProps>(function TopologyCanvas(
-  { model, snapshotRevision, selectedIds, selectedEdgeIds, onLayoutDirty, onNodeHover, onNodeSelect, onNodesBoxSelect, onClusterToggle, onEdgeSelect, simulation },
+  { model, snapshotRevision, selectedIds, selectedEdgeIds, onLayoutDirty, onNodeHover, onNodeSelect, onNodesBoxSelect, onClusterToggle, onEdgeSelect, simulation, simulationMode = false, simulationDevice, onSimulationDeviceRequest },
   ref,
 ) {
   const shellRef = useRef<HTMLDivElement>(null);
@@ -207,8 +237,22 @@ export const TopologyCanvas = forwardRef<TopologyCanvasHandle, TopologyCanvasPro
   const hasInitializedViewport = useRef(false);
   const boxGesture = useRef<{ pointerId: number; startX: number; startY: number } | undefined>(undefined);
   const [alignmentMenu, setAlignmentMenu] = useState<{ nodeId: string; label: string; x: number; y: number }>();
-  const handlers = useRef({ onLayoutDirty, onNodeHover, onNodeSelect, onNodesBoxSelect, onClusterToggle, onEdgeSelect });
+  const [simulationMenu, setSimulationMenu] = useState<{ nodeId: string; label: string; x: number; y: number }>();
+  const handlers = useRef({ onLayoutDirty, onNodeHover, onNodeSelect, onNodesBoxSelect, onClusterToggle, onEdgeSelect, onSimulationDeviceRequest });
   const simulationRef = useRef(simulation);
+  const simulationDeviceRef = useRef(simulationDevice);
+  const simulationModeRef = useRef(simulationMode);
+
+  const refreshSimulationDevicePosition = () => {
+    const cy = cyRef.current;
+    const current = simulationDeviceRef.current;
+    if (!cy || !current) return;
+    const target = cy.getElementById(current.deviceId);
+    const device = cy.getElementById("simulation-device");
+    if (target.empty() || device.empty()) return;
+    const position = target.position();
+    device.position({ x: position.x + 72, y: position.y - 48 });
+  };
 
   const refreshPacketPositions = () => {
     const cy = cyRef.current;
@@ -231,8 +275,13 @@ export const TopologyCanvas = forwardRef<TopologyCanvasHandle, TopologyCanvasPro
   };
 
   useEffect(() => {
-    handlers.current = { onLayoutDirty, onNodeHover, onNodeSelect, onNodesBoxSelect, onClusterToggle, onEdgeSelect };
-  }, [onClusterToggle, onEdgeSelect, onLayoutDirty, onNodeHover, onNodeSelect, onNodesBoxSelect]);
+    handlers.current = { onLayoutDirty, onNodeHover, onNodeSelect, onNodesBoxSelect, onClusterToggle, onEdgeSelect, onSimulationDeviceRequest };
+  }, [onClusterToggle, onEdgeSelect, onLayoutDirty, onNodeHover, onNodeSelect, onNodesBoxSelect, onSimulationDeviceRequest]);
+
+  useEffect(() => {
+    simulationModeRef.current = simulationMode;
+    if (!simulationMode) setSimulationMenu(undefined);
+  }, [simulationMode]);
 
   useImperativeHandle(ref, () => ({
     fit: () => cyRef.current?.fit(undefined, 64),
@@ -265,13 +314,31 @@ export const TopologyCanvas = forwardRef<TopologyCanvasHandle, TopologyCanvasPro
     });
     cyRef.current = cy;
     hasInitializedViewport.current = false;
+    let resizeFrame = 0;
+    const resizeCanvas = () => {
+      cancelAnimationFrame(resizeFrame);
+      resizeFrame = requestAnimationFrame(() => {
+        cy.resize();
+        if (cy.elements().length > 0) cy.fit(undefined, 64);
+        refreshPacketPositions();
+        refreshSimulationDevicePosition();
+      });
+    };
+    const resizeObserver = typeof ResizeObserver === "undefined" ? undefined : new ResizeObserver(resizeCanvas);
+    resizeObserver?.observe(containerRef.current);
+    window.addEventListener("resize", resizeCanvas);
 
-    const nodeOver = (event: EventObject) => handlers.current.onNodeHover(event.target.id());
-    const nodeOut = () => handlers.current.onNodeHover(undefined);
+    const nodeOver = (event: EventObject) => {
+      if ((event.target.data() as { kind?: string }).kind !== "simulation-device") handlers.current.onNodeHover(event.target.id());
+    };
+    const nodeOut = (event: EventObject) => {
+      if ((event.target.data() as { kind?: string }).kind !== "simulation-device") handlers.current.onNodeHover(undefined);
+    };
     const nodeTap = (event: EventObject) => {
       setAlignmentMenu(undefined);
+      setSimulationMenu(undefined);
       const data = event.target.data() as { kind: string; id: string };
-      if (data.kind === "simulation-packet") return;
+      if (data.kind === "simulation-packet" || data.kind === "simulation-device") return;
       if (data.kind === "cluster") handlers.current.onClusterToggle(data.id);
       else {
         const original = event.originalEvent as MouseEvent | undefined;
@@ -280,6 +347,7 @@ export const TopologyCanvas = forwardRef<TopologyCanvasHandle, TopologyCanvasPro
     };
     const edgeTap = (event: EventObject) => {
       setAlignmentMenu(undefined);
+      setSimulationMenu(undefined);
       const original = event.originalEvent as MouseEvent | undefined;
       handlers.current.onEdgeSelect(event.target.data() as GraphEdgeData, Boolean(original?.ctrlKey));
     };
@@ -288,15 +356,32 @@ export const TopologyCanvas = forwardRef<TopologyCanvasHandle, TopologyCanvasPro
       const movedNodes = event.target.selected() ? cy.nodes(":selected") : cy.collection(event.target);
       movedNodes.forEach((node) => { workingPositions.current.set(node.id(), node.position()); });
       handlers.current.onLayoutDirty();
+      refreshSimulationDevicePosition();
     };
     const backgroundTap = (event: EventObject) => {
       if (event.target === cy) {
         setAlignmentMenu(undefined);
+        setSimulationMenu(undefined);
         handlers.current.onNodeSelect(undefined);
         handlers.current.onEdgeSelect(undefined);
       }
     };
     const nodeContextTap = (event: EventObject) => {
+      const data = event.target.data() as GraphNodeData;
+      if (simulationModeRef.current && !["cluster", "simulation-packet", "simulation-device"].includes(data.kind)) {
+        (event.originalEvent as MouseEvent | undefined)?.preventDefault();
+        const renderedPosition = event.renderedPosition;
+        const shell = shellRef.current;
+        if (!shell || !renderedPosition) return;
+        setAlignmentMenu(undefined);
+        setSimulationMenu({
+          nodeId: data.id,
+          label: data.hostname,
+          x: Math.max(8, Math.min(renderedPosition.x + 8, shell.clientWidth - 184)),
+          y: Math.max(8, Math.min(renderedPosition.y + 8, shell.clientHeight - 82)),
+        });
+        return;
+      }
       const selectedNodes = cy.nodes(":selected");
       if (!event.target.selected() || selectedNodes.length < 2) {
         setAlignmentMenu(undefined);
@@ -306,7 +391,6 @@ export const TopologyCanvas = forwardRef<TopologyCanvasHandle, TopologyCanvasPro
       const renderedPosition = event.renderedPosition;
       const shell = shellRef.current;
       if (!shell || !renderedPosition) return;
-      const data = event.target.data() as GraphNodeData;
       setAlignmentMenu({
         nodeId: data.id,
         label: data.hostname,
@@ -314,7 +398,7 @@ export const TopologyCanvas = forwardRef<TopologyCanvasHandle, TopologyCanvasPro
         y: Math.max(8, Math.min(renderedPosition.y + 8, shell.clientHeight - 112)),
       });
     };
-    const closeAlignmentMenu = () => setAlignmentMenu(undefined);
+    const closeContextMenus = () => { setAlignmentMenu(undefined); setSimulationMenu(undefined); };
     cy.on("mouseover", "node", nodeOver);
     cy.on("mouseout", "node", nodeOut);
     cy.on("tap", "node", nodeTap);
@@ -322,10 +406,13 @@ export const TopologyCanvas = forwardRef<TopologyCanvasHandle, TopologyCanvasPro
     cy.on("cxttap", "node", nodeContextTap);
     cy.on("dragfree", "node", nodeDragFree);
     cy.on("tap", backgroundTap);
-    cy.on("pan zoom", closeAlignmentMenu);
-    cy.on("position drag", 'node[kind != "simulation-packet"]', refreshPacketPositions);
+    cy.on("pan zoom", closeContextMenus);
+    cy.on("position drag", 'node[kind != "simulation-packet"][kind != "simulation-device"]', () => { refreshPacketPositions(); refreshSimulationDevicePosition(); });
 
     return () => {
+      resizeObserver?.disconnect();
+      window.removeEventListener("resize", resizeCanvas);
+      cancelAnimationFrame(resizeFrame);
       cy.destroy();
       cyRef.current = undefined;
     };
@@ -358,6 +445,20 @@ export const TopologyCanvas = forwardRef<TopologyCanvasHandle, TopologyCanvasPro
     }
     keyboardIndex.current = -1;
   }, [model, snapshotRevision]);
+
+  useEffect(() => {
+    simulationDeviceRef.current = simulationDevice;
+    const cy = cyRef.current;
+    if (!cy) return;
+    cy.getElementById("simulation-device-edge").remove();
+    cy.getElementById("simulation-device").remove();
+    if (!simulationDevice || cy.getElementById(simulationDevice.deviceId).empty()) return;
+    cy.add([
+      { group: "nodes", data: { id: "simulation-device", kind: "simulation-device", label: `模拟设备\n${simulationDevice.sourceIp}` }, grabbable: false, selectable: false },
+      { group: "edges", data: { id: "simulation-device-edge", source: "simulation-device", target: simulationDevice.deviceId }, classes: "simulation-device-edge", selectable: false },
+    ]);
+    refreshSimulationDevicePosition();
+  }, [model, simulationDevice]);
 
   useEffect(() => {
     simulationRef.current = simulation;
@@ -477,7 +578,7 @@ export const TopologyCanvas = forwardRef<TopologyCanvasHandle, TopologyCanvasPro
         bottom: Math.max(gesture.startY, point.y),
       };
       const ids = cyRef.current?.nodes().filter((node) => {
-        if (["cluster", "simulation-packet"].includes((node.data() as GraphNodeData).kind)) return false;
+        if (["cluster", "simulation-packet", "simulation-device"].includes((node.data() as GraphNodeData).kind)) return false;
         const bounds = node.renderedBoundingBox({ includeLabels: false, includeOverlays: false });
         return selectionRectanglesIntersect(selectionRectangle, { left: bounds.x1, top: bounds.y1, right: bounds.x2, bottom: bounds.y2 });
       }).map((node) => node.id()) ?? [];
@@ -512,6 +613,30 @@ export const TopologyCanvas = forwardRef<TopologyCanvasHandle, TopologyCanvasPro
     updateSelectionBox(gesture.startX, gesture.startY, point.x, point.y);
   };
 
+  const handleContextMenu = (event: ReactMouseEvent<HTMLDivElement>) => {
+    event.preventDefault();
+    const cy = cyRef.current;
+    const shell = shellRef.current;
+    if (!simulationMode || !cy || !shell) return;
+    const bounds = shell.getBoundingClientRect();
+    const point = { x: event.clientX - bounds.left, y: event.clientY - bounds.top };
+    const target = cy.nodes().filter((node) => {
+      const kind = (node.data() as GraphNodeData).kind;
+      if (["cluster", "simulation-packet", "simulation-device"].includes(kind)) return false;
+      const box = node.renderedBoundingBox({ includeLabels: false, includeOverlays: true });
+      return point.x >= box.x1 - 5 && point.x <= box.x2 + 5 && point.y >= box.y1 - 5 && point.y <= box.y2 + 5;
+    }).first();
+    if (target.empty()) return;
+    const data = target.data() as GraphNodeData;
+    setAlignmentMenu(undefined);
+    setSimulationMenu({
+      nodeId: data.id,
+      label: data.hostname,
+      x: Math.max(8, Math.min(point.x + 8, shell.clientWidth - 184)),
+      y: Math.max(8, Math.min(point.y + 8, shell.clientHeight - 82)),
+    });
+  };
+
   const alignSelectedNodes = (direction: "horizontal" | "vertical") => {
     const cy = cyRef.current;
     const referenceNode = alignmentMenu ? cy?.getElementById(alignmentMenu.nodeId) : undefined;
@@ -540,7 +665,7 @@ export const TopologyCanvas = forwardRef<TopologyCanvasHandle, TopologyCanvasPro
       onPointerMoveCapture={handlePointerMoveCapture}
       onPointerUpCapture={(event) => finishBoxGesture(event, true)}
       onPointerCancel={(event) => finishBoxGesture(event, false)}
-      onContextMenu={(event) => event.preventDefault()}
+      onContextMenu={handleContextMenu}
     >
       <div ref={containerRef} className="topology-canvas" />
       <div ref={selectionBoxRef} className="topology-selection-box" aria-hidden="true" />
@@ -549,6 +674,12 @@ export const TopologyCanvas = forwardRef<TopologyCanvasHandle, TopologyCanvasPro
           <p title={alignmentMenu.label}>以 {alignmentMenu.label} 为基准</p>
           <button type="button" role="menuitem" onClick={() => alignSelectedNodes("horizontal")}><span className="align-icon horizontal" />横向对齐<small>统一 Y</small></button>
           <button type="button" role="menuitem" onClick={() => alignSelectedNodes("vertical")}><span className="align-icon vertical" />纵向对齐<small>统一 X</small></button>
+        </div>
+      )}
+      {simulationMenu && (
+        <div className="alignment-menu simulation-context-menu" role="menu" style={{ left: simulationMenu.x, top: simulationMenu.y }} onPointerDown={(event) => event.stopPropagation()}>
+          <p title={simulationMenu.label}>{simulationMenu.label}</p>
+          <button type="button" role="menuitem" onClick={() => { handlers.current.onSimulationDeviceRequest?.(simulationMenu.nodeId); setSimulationMenu(undefined); }}><span className="simulation-source-icon" />创建模拟设备<small>填写源 IP</small></button>
         </div>
       )}
     </div>

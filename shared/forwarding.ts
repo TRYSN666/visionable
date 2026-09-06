@@ -5,6 +5,11 @@ export type RouteAction = "forward" | "connected" | "local" | "drop" | "vxlan";
 export type MacAction = "interface" | "remote" | "drop";
 export type VxlanMode = "l2" | "l3";
 
+export interface ForwardingWorkbookLocation {
+  row: number;
+  sourceFile?: string;
+}
+
 export interface ForwardingMetadata {
   templateVersion: string;
   batchName: string;
@@ -12,8 +17,7 @@ export interface ForwardingMetadata {
   note?: string;
 }
 
-export interface ForwardingInterface {
-  row: number;
+export interface ForwardingInterface extends ForwardingWorkbookLocation {
   deviceId: string;
   deviceName: string;
   interfaceName: string;
@@ -27,8 +31,7 @@ export interface ForwardingInterface {
   status: ForwardingStatus;
 }
 
-export interface ForwardingLagMember {
-  row: number;
+export interface ForwardingLagMember extends ForwardingWorkbookLocation {
   deviceId: string;
   deviceName: string;
   aggregateInterface: string;
@@ -36,8 +39,7 @@ export interface ForwardingLagMember {
   status: ForwardingStatus;
 }
 
-export interface ForwardingRoute {
-  row: number;
+export interface ForwardingRoute extends ForwardingWorkbookLocation {
   deviceId: string;
   deviceName: string;
   vrf: string;
@@ -50,8 +52,7 @@ export interface ForwardingRoute {
   remoteVtep?: string;
 }
 
-export interface ForwardingArp {
-  row: number;
+export interface ForwardingArp extends ForwardingWorkbookLocation {
   deviceId: string;
   deviceName: string;
   vrf: string;
@@ -61,8 +62,7 @@ export interface ForwardingArp {
   status: "reachable" | "stale" | "static" | "incomplete";
 }
 
-export interface ForwardingMac {
-  row: number;
+export interface ForwardingMac extends ForwardingWorkbookLocation {
   deviceId: string;
   deviceName: string;
   vlan: number;
@@ -73,8 +73,7 @@ export interface ForwardingMac {
   remoteVtep?: string;
 }
 
-export interface ForwardingVxlan {
-  row: number;
+export interface ForwardingVxlan extends ForwardingWorkbookLocation {
   deviceId: string;
   deviceName: string;
   vni: number;
@@ -119,6 +118,7 @@ export interface ForwardingSnapshotSummary {
 }
 
 export interface ForwardingImportIssue {
+  sourceFile?: string;
   sheet: string;
   row: number;
   column: string;
@@ -159,6 +159,7 @@ export interface ForwardingTraceState {
   packet: AbstractPacket;
   summary: string;
   evidence?: Array<{
+    sourceFile?: string;
     sheet: string;
     row: number;
     description: string;
