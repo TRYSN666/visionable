@@ -1,0 +1,17 @@
+{{- if not .Values.data.existingClaim }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "network-topology.fullname" . }}-data
+  labels:
+    {{- include "network-topology.labels" . | nindent 4 }}
+spec:
+  accessModes:
+    {{- toYaml .Values.data.accessModes | nindent 4 }}
+  {{- if .Values.data.storageClassName }}
+  storageClassName: {{ .Values.data.storageClassName | quote }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.data.size }}
+{{- end }}

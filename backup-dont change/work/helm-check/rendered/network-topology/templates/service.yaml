@@ -1,0 +1,23 @@
+---
+# Source: network-topology/templates/service.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: topology-network-topology
+  labels:
+    helm.sh/chart: network-topology-0.1.0
+    app.kubernetes.io/name: network-topology
+    app.kubernetes.io/instance: topology
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: network-topology
+    app.kubernetes.io/instance: topology
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+      protocol: TCP
+

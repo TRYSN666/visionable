@@ -1,0 +1,81 @@
+---
+# Source: network-topology/templates/deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: topology-network-topology
+  labels:
+    helm.sh/chart: network-topology-0.1.0
+    app.kubernetes.io/name: network-topology
+    app.kubernetes.io/instance: topology
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: network-topology
+      app.kubernetes.io/instance: topology
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: network-topology
+        app.kubernetes.io/instance: topology
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: topology
+          image: "registry.example.com/visionable/network-topology:0.1.0"
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          env:
+            - name: NODE_ENV
+              value: production
+            - name: PORT
+              value: "3000"
+            - name: DEVICE_CONFIG_DIR
+              value: "/data/device-config"
+          ports:
+            - name: http
+              containerPort: 3000
+              protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 20
+          resources:
+            limits:
+              cpu: 1000m
+              memory: 512Mi
+            requests:
+              cpu: 100m
+              memory: 128Mi
+          volumeMounts:
+            - name: device-config
+              mountPath: /data/device-config
+              readOnly: true
+      volumes:
+        - name: device-config
+          persistentVolumeClaim:
+            claimName: device-config
+            readOnly: true
+

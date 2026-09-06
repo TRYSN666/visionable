@@ -1,0 +1,7 @@
+{{- if .Values.ingress.enabled }}
+Network Topology is exposed through the configured Ingress.
+Run `kubectl get ingress {{ include "network-topology.fullname" . }} -n {{ .Release.Namespace }}` to check its address.
+{{- else }}
+Network Topology is available through the ClusterIP Service {{ include "network-topology.fullname" . }}.
+{{- end }}
+PVC {{ .Values.config.existingClaim }} is mounted read-only at {{ .Values.config.mountPath }}.
