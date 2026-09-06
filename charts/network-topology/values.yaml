@@ -1,0 +1,50 @@
+replicaCount: 1
+
+image:
+  repository: registry.example.com/visionable/network-topology
+  tag: "0.1.0"
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+service:
+  type: ClusterIP
+  port: 80
+  targetPort: 3000
+
+config:
+  existingClaim: device-config
+  mountPath: /data/device-config
+  initialPortsCsvPath: ""
+
+data:
+  existingClaim: ""
+  mountPath: /data/app
+  storageClassName: ""
+  accessModes:
+    - ReadWriteOnce
+  size: 1Gi
+
+ingress:
+  enabled: true
+  className: nginx
+  annotations: {}
+  hostnames: []
+  pathPrefix: /
+  tls: []
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 1000m
+    memory: 512Mi
+
+podAnnotations: {}
+podLabels: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}

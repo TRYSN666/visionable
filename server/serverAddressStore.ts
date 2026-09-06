@@ -1,0 +1,492 @@
+import { randomUUID } from "node:crypto";
+import { mkdirSync } from "node:fs";
+import path from "node:path";
+import { DatabaseSync } from "node:sqlite";
+import type {
+  ForwardingSnapshotData,
+  ForwardingSnapshotSummary,
+} from "../shared/forwarding.js";
+import type { TopologyPosition, TopologyProject, TopologySnapshot, TopologySummary } from "../shared/topology.js";
+
+export interface ServerAddressOverride {
+  hostname: string;
+  inBandIp: string;
+  outOfBandIp: string;
+  updatedAt: string;
+}
+
+interface OverrideRow {
+  hostname: string;
+  in_band_ip: string;
+  out_of_band_ip: string;
+  updated_at: string;
+}
+
+interface PositionRow {
+  node_id: string;
+  x: number;
+  y: number;
+}
+
+interface ProjectRow {
+  id: string;
+  name: string;
+  created_at: string;
+  updated_at: string;
+}
+
+interface TopologyRow {
+  id: string;
+  project_id: string;
+  name: string;
+  source_type: "nvue" | "ports-csv";
+  snapshot_json: string | null;
+  node_count: number;
+  link_count: number;
+  created_at: string;
+  updated_at: string;
+}
+
+interface ForwardingSnapshotRow {
+  id: string;
+  topology_id: string;
+  template_version: string;
+  batch_name: string;
+  collected_at: string;
+  imported_at: string;
+  note: string | null;
+  topology_fingerprint: string;
+  is_default: number;
+  counts_json: string;
+}
+
+export class ServerAddressStore {
+  private readonly database: DatabaseSync;
+
+  constructor(databasePath: string) {
+    if (databasePath !== ":memory:") mkdirSync(path.dirname(databasePath), { recursive: true });
+    this.database = new DatabaseSync(databasePath, { timeout: 5000 });
+    this.database.exec("PRAGMA foreign_keys = ON");
+    this.database.exec("PRAGMA journal_mode = WAL");
+    this.database.exec("PRAGMA synchronous = NORMAL");
+    this.database.exec(`
+      CREATE TABLE IF NOT EXISTS server_address_overrides (
+        hostname TEXT PRIMARY KEY COLLATE NOCASE,
+        in_band_ip TEXT NOT NULL,
+        out_of_band_ip TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      ) STRICT
+    `);
+    this.database.exec(`
+      CREATE TABLE IF NOT EXISTS topology_layout_positions (
+        node_id TEXT PRIMARY KEY,
+        x REAL NOT NULL,
+        y REAL NOT NULL,
+        updated_at TEXT NOT NULL
+      ) STRICT
+    `);
+    this.database.exec(`
+      CREATE TABLE IF NOT EXISTS topology_projects (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL COLLATE NOCASE UNIQUE,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      ) STRICT
+    `);
+    this.database.exec(`
+      CREATE TABLE IF NOT EXISTS topology_catalog (
+        id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL REFERENCES topology_projects(id),
+        name TEXT NOT NULL COLLATE NOCASE,
+        source_type TEXT NOT NULL CHECK(source_type IN ('nvue', 'ports-csv')),
+        snapshot_json TEXT,
+        node_count INTEGER NOT NULL,
+        link_count INTEGER NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        UNIQUE(project_id, name)
+      ) STRICT
+    `);
+    this.database.exec("CREATE INDEX IF NOT EXISTS idx_topology_catalog_project_id ON topology_catalog(project_id)");
+    this.database.exec(`
+      CREATE TABLE IF NOT EXISTS topology_layout_positions_v2 (
+        topology_id TEXT NOT NULL,
+        node_id TEXT NOT NULL,
+        x REAL NOT NULL,
+        y REAL NOT NULL,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY(topology_id, node_id)
+      ) STRICT
+    `);
+    this.database.exec(`
+      INSERT OR IGNORE INTO topology_layout_positions_v2 (topology_id, node_id, x, y, updated_at)
+      SELECT 'metta-roce', node_id, x, y, updated_at FROM topology_layout_positions
+    `);
+    this.database.exec(`
+      CREATE TABLE IF NOT EXISTS forwarding_snapshots (
+        id TEXT PRIMARY KEY,
+        topology_id TEXT NOT NULL REFERENCES topology_catalog(id) ON DELETE CASCADE,
+        template_version TEXT NOT NULL,
+        batch_name TEXT NOT NULL,
+        collected_at TEXT NOT NULL,
+        imported_at TEXT NOT NULL,
+        note TEXT,
+        topology_fingerprint TEXT NOT NULL,
+        is_default INTEGER NOT NULL CHECK(is_default IN (0, 1)),
+        counts_json TEXT NOT NULL,
+        UNIQUE(topology_id, id)
+      ) STRICT
+    `);
+    this.database.exec("CREATE INDEX IF NOT EXISTS idx_forwarding_snapshots_topology ON forwarding_snapshots(topology_id, imported_at DESC)");
+    this.database.exec(`
+      CREATE TABLE IF NOT EXISTS forwarding_interfaces (
+        topology_id TEXT NOT NULL,
+        snapshot_id TEXT NOT NULL,
+        row_number INTEGER NOT NULL,
+        device_id TEXT NOT NULL,
+        device_name TEXT NOT NULL,
+        interface_name TEXT NOT NULL,
+        interface_type TEXT NOT NULL,
+        forwarding_mode TEXT NOT NULL,
+        vrf TEXT NOT NULL,
+        vlan INTEGER,
+        allowed_vlans_json TEXT NOT NULL,
+        bridge TEXT,
+        mac TEXT,
+        status TEXT NOT NULL,
+        PRIMARY KEY(topology_id, snapshot_id, row_number),
+        FOREIGN KEY(topology_id, snapshot_id) REFERENCES forwarding_snapshots(topology_id, id) ON DELETE CASCADE
+      ) STRICT
+    `);
+    this.database.exec(`
+      CREATE TABLE IF NOT EXISTS forwarding_lag_members (
+        topology_id TEXT NOT NULL,
+        snapshot_id TEXT NOT NULL,
+        row_number INTEGER NOT NULL,
+        device_id TEXT NOT NULL,
+        device_name TEXT NOT NULL,
+        aggregate_interface TEXT NOT NULL,
+        member_interface TEXT NOT NULL,
+        status TEXT NOT NULL,
+        PRIMARY KEY(topology_id, snapshot_id, row_number),
+        FOREIGN KEY(topology_id, snapshot_id) REFERENCES forwarding_snapshots(topology_id, id) ON DELETE CASCADE
+      ) STRICT
+    `);
+    this.database.exec(`
+      CREATE TABLE IF NOT EXISTS forwarding_routes (
+        topology_id TEXT NOT NULL,
+        snapshot_id TEXT NOT NULL,
+        row_number INTEGER NOT NULL,
+        device_id TEXT NOT NULL,
+        device_name TEXT NOT NULL,
+        vrf TEXT NOT NULL,
+        destination_cidr TEXT NOT NULL,
+        action TEXT NOT NULL,
+        next_hop TEXT,
+        output_interface TEXT,
+        ecmp_group TEXT,
+        vni INTEGER,
+        remote_vtep TEXT,
+        PRIMARY KEY(topology_id, snapshot_id, row_number),
+        FOREIGN KEY(topology_id, snapshot_id) REFERENCES forwarding_snapshots(topology_id, id) ON DELETE CASCADE
+      ) STRICT
+    `);
+    this.database.exec(`
+      CREATE TABLE IF NOT EXISTS forwarding_arp_entries (
+        topology_id TEXT NOT NULL,
+        snapshot_id TEXT NOT NULL,
+        row_number INTEGER NOT NULL,
+        device_id TEXT NOT NULL,
+        device_name TEXT NOT NULL,
+        vrf TEXT NOT NULL,
+        ip TEXT NOT NULL,
+        mac TEXT NOT NULL,
+        interface_name TEXT NOT NULL,
+        status TEXT NOT NULL,
+        PRIMARY KEY(topology_id, snapshot_id, row_number),
+        FOREIGN KEY(topology_id, snapshot_id) REFERENCES forwarding_snapshots(topology_id, id) ON DELETE CASCADE
+      ) STRICT
+    `);
+    this.database.exec(`
+      CREATE TABLE IF NOT EXISTS forwarding_mac_entries (
+        topology_id TEXT NOT NULL,
+        snapshot_id TEXT NOT NULL,
+        row_number INTEGER NOT NULL,
+        device_id TEXT NOT NULL,
+        device_name TEXT NOT NULL,
+        vlan INTEGER NOT NULL,
+        mac TEXT NOT NULL,
+        action TEXT NOT NULL,
+        output_interface TEXT,
+        vni INTEGER,
+        remote_vtep TEXT,
+        PRIMARY KEY(topology_id, snapshot_id, row_number),
+        FOREIGN KEY(topology_id, snapshot_id) REFERENCES forwarding_snapshots(topology_id, id) ON DELETE CASCADE
+      ) STRICT
+    `);
+    this.database.exec(`
+      CREATE TABLE IF NOT EXISTS forwarding_vxlan_entries (
+        topology_id TEXT NOT NULL,
+        snapshot_id TEXT NOT NULL,
+        row_number INTEGER NOT NULL,
+        device_id TEXT NOT NULL,
+        device_name TEXT NOT NULL,
+        vni INTEGER NOT NULL,
+        mode TEXT NOT NULL,
+        local_vtep TEXT NOT NULL,
+        vlan INTEGER,
+        tenant_vrf TEXT,
+        underlay_vrf TEXT NOT NULL,
+        udp_destination_port INTEGER NOT NULL,
+        status TEXT NOT NULL,
+        PRIMARY KEY(topology_id, snapshot_id, row_number),
+        FOREIGN KEY(topology_id, snapshot_id) REFERENCES forwarding_snapshots(topology_id, id) ON DELETE CASCADE
+      ) STRICT
+    `);
+    for (const table of ["forwarding_interfaces", "forwarding_lag_members", "forwarding_routes", "forwarding_arp_entries", "forwarding_mac_entries", "forwarding_vxlan_entries"]) {
+      this.database.exec(`CREATE INDEX IF NOT EXISTS idx_${table}_snapshot_device ON ${table}(topology_id, snapshot_id, device_id)`);
+    }
+    this.database.exec("PRAGMA optimize");
+  }
+
+  all(): Map<string, ServerAddressOverride> {
+    const rows = this.database
+      .prepare("SELECT hostname, in_band_ip, out_of_band_ip, updated_at FROM server_address_overrides ORDER BY hostname")
+      .all() as unknown as OverrideRow[];
+    return new Map(rows.map((row) => [row.hostname.toLowerCase(), {
+      hostname: row.hostname,
+      inBandIp: row.in_band_ip,
+      outOfBandIp: row.out_of_band_ip,
+      updatedAt: row.updated_at,
+    }]));
+  }
+
+  upsert(hostname: string, inBandIp: string, outOfBandIp: string): ServerAddressOverride {
+    const updatedAt = new Date().toISOString();
+    this.database.prepare(`
+      INSERT INTO server_address_overrides (hostname, in_band_ip, out_of_band_ip, updated_at)
+      VALUES (?, ?, ?, ?)
+      ON CONFLICT(hostname) DO UPDATE SET
+        in_band_ip = excluded.in_band_ip,
+        out_of_band_ip = excluded.out_of_band_ip,
+        updated_at = excluded.updated_at
+    `).run(hostname, inBandIp, outOfBandIp, updatedAt);
+    return { hostname, inBandIp, outOfBandIp, updatedAt };
+  }
+
+  delete(hostname: string): void {
+    this.database.prepare("DELETE FROM server_address_overrides WHERE hostname = ?").run(hostname);
+  }
+
+  ensureDefaultCatalog(nodeCount: number, linkCount: number): void {
+    const now = new Date().toISOString();
+    this.database.prepare(`
+      INSERT INTO topology_projects (id, name, created_at, updated_at)
+      VALUES ('metta', 'Metta', ?, ?)
+      ON CONFLICT(id) DO NOTHING
+    `).run(now, now);
+    this.database.prepare(`
+      INSERT INTO topology_catalog (id, project_id, name, source_type, snapshot_json, node_count, link_count, created_at, updated_at)
+      VALUES ('metta-roce', 'metta', 'Metta RoCE网络', 'nvue', NULL, ?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET node_count = excluded.node_count, link_count = excluded.link_count, updated_at = excluded.updated_at
+    `).run(nodeCount, linkCount, now, now);
+  }
+
+  listProjects(): TopologyProject[] {
+    const projects = this.database.prepare("SELECT id, name, created_at, updated_at FROM topology_projects ORDER BY created_at, name").all() as unknown as ProjectRow[];
+    const topologies = this.database.prepare(`
+      SELECT id, project_id, name, source_type, snapshot_json, node_count, link_count, created_at, updated_at
+      FROM topology_catalog ORDER BY created_at, name
+    `).all() as unknown as TopologyRow[];
+    return projects.map((project) => ({
+      id: project.id,
+      name: project.name,
+      createdAt: project.created_at,
+      updatedAt: project.updated_at,
+      topologies: topologies.filter((topology) => topology.project_id === project.id).map((topology): TopologySummary => ({
+        id: topology.id,
+        projectId: topology.project_id,
+        name: topology.name,
+        sourceType: topology.source_type,
+        nodeCount: topology.node_count,
+        linkCount: topology.link_count,
+        createdAt: topology.created_at,
+        updatedAt: topology.updated_at,
+      })),
+    }));
+  }
+
+  createProject(id: string, name: string): void {
+    const now = new Date().toISOString();
+    this.database.prepare("INSERT INTO topology_projects (id, name, created_at, updated_at) VALUES (?, ?, ?, ?)").run(id, name, now, now);
+  }
+
+  renameProject(id: string, name: string): boolean {
+    const result = this.database.prepare("UPDATE topology_projects SET name = ?, updated_at = ? WHERE id = ?").run(name, new Date().toISOString(), id);
+    return result.changes > 0;
+  }
+
+  saveImportedTopology(id: string, projectId: string, name: string, snapshot: TopologySnapshot): void {
+    const now = new Date().toISOString();
+    this.database.prepare(`
+      INSERT INTO topology_catalog (id, project_id, name, source_type, snapshot_json, node_count, link_count, created_at, updated_at)
+      VALUES (?, ?, ?, 'ports-csv', ?, ?, ?, ?, ?)
+    `).run(id, projectId, name, JSON.stringify({ ...snapshot, layoutPositions: {} }), snapshot.nodes.length, snapshot.links.length, now, now);
+  }
+
+  renameTopology(projectId: string, topologyId: string, name: string): boolean {
+    const result = this.database.prepare("UPDATE topology_catalog SET name = ?, updated_at = ? WHERE id = ? AND project_id = ?").run(name, new Date().toISOString(), topologyId, projectId);
+    return result.changes > 0;
+  }
+
+  importedTopology(projectId: string, topologyId: string): TopologySnapshot | undefined {
+    const row = this.database.prepare(`
+      SELECT snapshot_json FROM topology_catalog WHERE id = ? AND project_id = ? AND source_type = 'ports-csv'
+    `).get(topologyId, projectId) as { snapshot_json: string | null } | undefined;
+    return row?.snapshot_json ? JSON.parse(row.snapshot_json) as TopologySnapshot : undefined;
+  }
+
+  topologySummary(projectId: string, topologyId: string): TopologySummary | undefined {
+    return this.listProjects().find((project) => project.id === projectId)?.topologies.find((topology) => topology.id === topologyId);
+  }
+
+  layoutPositions(topologyId = "metta-roce"): Record<string, TopologyPosition> {
+    const rows = this.database
+      .prepare("SELECT node_id, x, y FROM topology_layout_positions_v2 WHERE topology_id = ? ORDER BY node_id")
+      .all(topologyId) as unknown as PositionRow[];
+    return Object.fromEntries(rows.map((row) => [row.node_id, { x: row.x, y: row.y }]));
+  }
+
+  saveLayout(positions: Record<string, TopologyPosition>, topologyId = "metta-roce"): void {
+    const statement = this.database.prepare(`
+      INSERT INTO topology_layout_positions_v2 (topology_id, node_id, x, y, updated_at)
+      VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT(topology_id, node_id) DO UPDATE SET
+        x = excluded.x,
+        y = excluded.y,
+        updated_at = excluded.updated_at
+    `);
+    const updatedAt = new Date().toISOString();
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      for (const [nodeId, position] of Object.entries(positions)) {
+        statement.run(topologyId, nodeId, position.x, position.y, updatedAt);
+      }
+      this.database.exec("COMMIT");
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  saveForwardingSnapshot(topologyId: string, topologyFingerprint: string, data: ForwardingSnapshotData): ForwardingSnapshotSummary {
+    const id = `forwarding-${randomUUID()}`;
+    const importedAt = new Date().toISOString();
+    const counts = {
+      interfaces: data.interfaces.length,
+      lagMembers: data.lagMembers.length,
+      routes: data.routes.length,
+      arpEntries: data.arpEntries.length,
+      macEntries: data.macEntries.length,
+      vxlanEntries: data.vxlanEntries.length,
+    };
+    const insertInterface = this.database.prepare(`
+      INSERT INTO forwarding_interfaces VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    const insertLag = this.database.prepare(`
+      INSERT INTO forwarding_lag_members VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    const insertRoute = this.database.prepare(`
+      INSERT INTO forwarding_routes VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    const insertArp = this.database.prepare(`
+      INSERT INTO forwarding_arp_entries VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    const insertMac = this.database.prepare(`
+      INSERT INTO forwarding_mac_entries VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    const insertVxlan = this.database.prepare(`
+      INSERT INTO forwarding_vxlan_entries VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      this.database.prepare("UPDATE forwarding_snapshots SET is_default = 0 WHERE topology_id = ?").run(topologyId);
+      this.database.prepare(`
+        INSERT INTO forwarding_snapshots
+          (id, topology_id, template_version, batch_name, collected_at, imported_at, note, topology_fingerprint, is_default, counts_json)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
+      `).run(id, topologyId, data.metadata.templateVersion, data.metadata.batchName, data.metadata.collectedAt, importedAt, data.metadata.note ?? null, topologyFingerprint, JSON.stringify(counts));
+      for (const item of data.interfaces) insertInterface.run(topologyId, id, item.row, item.deviceId, item.deviceName, item.interfaceName, item.interfaceType, item.forwardingMode, item.vrf, item.vlan ?? null, JSON.stringify(item.allowedVlans), item.bridge ?? null, item.mac ?? null, item.status);
+      for (const item of data.lagMembers) insertLag.run(topologyId, id, item.row, item.deviceId, item.deviceName, item.aggregateInterface, item.memberInterface, item.status);
+      for (const item of data.routes) insertRoute.run(topologyId, id, item.row, item.deviceId, item.deviceName, item.vrf, item.destinationCidr, item.action, item.nextHop ?? null, item.outputInterface ?? null, item.ecmpGroup ?? null, item.vni ?? null, item.remoteVtep ?? null);
+      for (const item of data.arpEntries) insertArp.run(topologyId, id, item.row, item.deviceId, item.deviceName, item.vrf, item.ip, item.mac, item.interfaceName, item.status);
+      for (const item of data.macEntries) insertMac.run(topologyId, id, item.row, item.deviceId, item.deviceName, item.vlan, item.mac, item.action, item.outputInterface ?? null, item.vni ?? null, item.remoteVtep ?? null);
+      for (const item of data.vxlanEntries) insertVxlan.run(topologyId, id, item.row, item.deviceId, item.deviceName, item.vni, item.mode, item.localVtep, item.vlan ?? null, item.tenantVrf ?? null, item.underlayVrf, item.udpDestinationPort, item.status);
+      const stale = this.database.prepare(`
+        SELECT id FROM forwarding_snapshots WHERE topology_id = ? ORDER BY imported_at DESC, rowid DESC LIMIT -1 OFFSET 5
+      `).all(topologyId) as unknown as Array<{ id: string }>;
+      const remove = this.database.prepare("DELETE FROM forwarding_snapshots WHERE topology_id = ? AND id = ?");
+      for (const item of stale) remove.run(topologyId, item.id);
+      this.database.exec("COMMIT");
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+    return this.listForwardingSnapshots(topologyId, topologyFingerprint).find((item) => item.id === id)!;
+  }
+
+  listForwardingSnapshots(topologyId: string, currentFingerprint: string): ForwardingSnapshotSummary[] {
+    const rows = this.database.prepare(`
+      SELECT id, topology_id, template_version, batch_name, collected_at, imported_at, note, topology_fingerprint, is_default, counts_json
+      FROM forwarding_snapshots WHERE topology_id = ? ORDER BY imported_at DESC, rowid DESC LIMIT 5
+    `).all(topologyId) as unknown as ForwardingSnapshotRow[];
+    return rows.map((row) => {
+      const compatible = row.topology_fingerprint === currentFingerprint;
+      return {
+        id: row.id,
+        topologyId: row.topology_id,
+        batchName: row.batch_name,
+        templateVersion: row.template_version,
+        collectedAt: row.collected_at,
+        importedAt: row.imported_at,
+        note: row.note ?? undefined,
+        isDefault: row.is_default === 1,
+        compatible,
+        compatibilityReason: compatible ? undefined : "拓扑设备、接口或物理链路结构已变化，请重新导入转发表",
+        counts: JSON.parse(row.counts_json) as ForwardingSnapshotSummary["counts"],
+      };
+    });
+  }
+
+  forwardingSnapshot(topologyId: string, snapshotId: string): ForwardingSnapshotData | undefined {
+    const row = this.database.prepare(`
+      SELECT id, topology_id, template_version, batch_name, collected_at, imported_at, note, topology_fingerprint, is_default, counts_json
+      FROM forwarding_snapshots WHERE topology_id = ? AND id = ?
+    `).get(topologyId, snapshotId) as ForwardingSnapshotRow | undefined;
+    if (!row) return undefined;
+    const interfaces = this.database.prepare(`SELECT * FROM forwarding_interfaces WHERE topology_id = ? AND snapshot_id = ? ORDER BY row_number`).all(topologyId, snapshotId) as unknown as Array<Record<string, unknown>>;
+    const lagMembers = this.database.prepare(`SELECT * FROM forwarding_lag_members WHERE topology_id = ? AND snapshot_id = ? ORDER BY row_number`).all(topologyId, snapshotId) as unknown as Array<Record<string, unknown>>;
+    const routes = this.database.prepare(`SELECT * FROM forwarding_routes WHERE topology_id = ? AND snapshot_id = ? ORDER BY row_number`).all(topologyId, snapshotId) as unknown as Array<Record<string, unknown>>;
+    const arpEntries = this.database.prepare(`SELECT * FROM forwarding_arp_entries WHERE topology_id = ? AND snapshot_id = ? ORDER BY row_number`).all(topologyId, snapshotId) as unknown as Array<Record<string, unknown>>;
+    const macEntries = this.database.prepare(`SELECT * FROM forwarding_mac_entries WHERE topology_id = ? AND snapshot_id = ? ORDER BY row_number`).all(topologyId, snapshotId) as unknown as Array<Record<string, unknown>>;
+    const vxlanEntries = this.database.prepare(`SELECT * FROM forwarding_vxlan_entries WHERE topology_id = ? AND snapshot_id = ? ORDER BY row_number`).all(topologyId, snapshotId) as unknown as Array<Record<string, unknown>>;
+    return {
+      metadata: { templateVersion: row.template_version, batchName: row.batch_name, collectedAt: row.collected_at, note: row.note ?? undefined },
+      interfaces: interfaces.map((item) => ({ row: item.row_number as number, deviceId: item.device_id as string, deviceName: item.device_name as string, interfaceName: item.interface_name as string, interfaceType: item.interface_type as ForwardingSnapshotData["interfaces"][number]["interfaceType"], forwardingMode: item.forwarding_mode as ForwardingSnapshotData["interfaces"][number]["forwardingMode"], vrf: item.vrf as string, vlan: item.vlan == null ? undefined : item.vlan as number, allowedVlans: JSON.parse(item.allowed_vlans_json as string) as number[], bridge: item.bridge == null ? undefined : item.bridge as string, mac: item.mac == null ? undefined : item.mac as string, status: item.status as ForwardingSnapshotData["interfaces"][number]["status"] })),
+      lagMembers: lagMembers.map((item) => ({ row: item.row_number as number, deviceId: item.device_id as string, deviceName: item.device_name as string, aggregateInterface: item.aggregate_interface as string, memberInterface: item.member_interface as string, status: item.status as ForwardingSnapshotData["lagMembers"][number]["status"] })),
+      routes: routes.map((item) => ({ row: item.row_number as number, deviceId: item.device_id as string, deviceName: item.device_name as string, vrf: item.vrf as string, destinationCidr: item.destination_cidr as string, action: item.action as ForwardingSnapshotData["routes"][number]["action"], nextHop: item.next_hop == null ? undefined : item.next_hop as string, outputInterface: item.output_interface == null ? undefined : item.output_interface as string, ecmpGroup: item.ecmp_group == null ? undefined : item.ecmp_group as string, vni: item.vni == null ? undefined : item.vni as number, remoteVtep: item.remote_vtep == null ? undefined : item.remote_vtep as string })),
+      arpEntries: arpEntries.map((item) => ({ row: item.row_number as number, deviceId: item.device_id as string, deviceName: item.device_name as string, vrf: item.vrf as string, ip: item.ip as string, mac: item.mac as string, interfaceName: item.interface_name as string, status: item.status as ForwardingSnapshotData["arpEntries"][number]["status"] })),
+      macEntries: macEntries.map((item) => ({ row: item.row_number as number, deviceId: item.device_id as string, deviceName: item.device_name as string, vlan: item.vlan as number, mac: item.mac as string, action: item.action as ForwardingSnapshotData["macEntries"][number]["action"], outputInterface: item.output_interface == null ? undefined : item.output_interface as string, vni: item.vni == null ? undefined : item.vni as number, remoteVtep: item.remote_vtep == null ? undefined : item.remote_vtep as string })),
+      vxlanEntries: vxlanEntries.map((item) => ({ row: item.row_number as number, deviceId: item.device_id as string, deviceName: item.device_name as string, vni: item.vni as number, mode: item.mode as ForwardingSnapshotData["vxlanEntries"][number]["mode"], localVtep: item.local_vtep as string, vlan: item.vlan == null ? undefined : item.vlan as number, tenantVrf: item.tenant_vrf == null ? undefined : item.tenant_vrf as string, underlayVrf: item.underlay_vrf as string, udpDestinationPort: item.udp_destination_port as number, status: item.status as ForwardingSnapshotData["vxlanEntries"][number]["status"] })),
+    };
+  }
+
+  forwardingSnapshotFingerprint(topologyId: string, snapshotId: string): string | undefined {
+    const row = this.database.prepare("SELECT topology_fingerprint FROM forwarding_snapshots WHERE topology_id = ? AND id = ?").get(topologyId, snapshotId) as { topology_fingerprint: string } | undefined;
+    return row?.topology_fingerprint;
+  }
+
+  close(): void {
+    this.database.close();
+  }
+}

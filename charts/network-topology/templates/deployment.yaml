@@ -1,0 +1,101 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "network-topology.fullname" . }}
+  labels:
+    {{- include "network-topology.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "network-topology.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "network-topology.selectorLabels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: topology
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          env:
+            - name: NODE_ENV
+              value: production
+            - name: PORT
+              value: {{ .Values.service.targetPort | quote }}
+            - name: DEVICE_CONFIG_DIR
+              value: {{ .Values.config.mountPath | quote }}
+            {{- if .Values.config.initialPortsCsvPath }}
+            - name: INITIAL_PORTS_CSV_PATH
+              value: {{ .Values.config.initialPortsCsvPath | quote }}
+            {{- end }}
+            - name: TOPOLOGY_DATA_DIR
+              value: {{ .Values.data.mountPath | quote }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.service.targetPort }}
+              protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 20
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - name: device-config
+              mountPath: {{ .Values.config.mountPath }}
+              readOnly: true
+            - name: app-data
+              mountPath: {{ .Values.data.mountPath }}
+      volumes:
+        - name: device-config
+          persistentVolumeClaim:
+            claimName: {{ required "config.existingClaim is required" .Values.config.existingClaim }}
+            readOnly: true
+        - name: app-data
+          persistentVolumeClaim:
+            claimName: {{ default (printf "%s-data" (include "network-topology.fullname" .)) .Values.data.existingClaim }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
