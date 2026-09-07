@@ -20,8 +20,8 @@ export interface AppOptions {
 export function createApp({ store, serveClient = false }: AppOptions) {
   const app = express();
   app.disable("x-powered-by");
-  // JSON escaping can make a valid 12 MiB CSV larger on the wire.
-  app.use(express.json({ limit: "26mb" }));
+  // A forwarding batch carries up to 24 MiB of XLSX data encoded as base64.
+  app.use(express.json({ limit: "36mb" }));
 
   const validName = (value: unknown): value is string => typeof value === "string" && value.trim().length > 0 && value.trim().length <= 80;
   const catalogError = (error: unknown): { status: number; message: string } => {
@@ -178,10 +178,42 @@ export function createApp({ store, serveClient = false }: AppOptions) {
     }
   });
 
-  app.post("/api/projects/:projectId/topologies/:topologyId/forwarding-snapshots", forwardingUpload, async (request, response) => {
-    if (!Buffer.isBuffer(request.body) || request.body.byteLength === 0) return void response.status(400).json({ error: "请以原始 XLSX 二进制上传转发表工作簿" });
+  app.get("/api/projects/:projectId/topologies/:topologyId/forwarding-snapshots/:snapshotId", (request, response) => {
+    response.setHeader("Cache-Control", "no-store");
     try {
-      const snapshot = await store.importForwardingSnapshot(request.params.projectId, request.params.topologyId, request.body);
+      response.status(200).json(store.forwardingSnapshotData(request.params.projectId, request.params.topologyId, request.params.snapshotId));
+    } catch (error) {
+      const status = error instanceof ForwardingSnapshotNotFoundError || error instanceof CatalogNotFoundError ? 404 : 400;
+      response.status(status).json({ error: error instanceof Error ? error.message : "无法读取转发表快照" });
+    }
+  });
+
+  app.post("/api/projects/:projectId/topologies/:topologyId/forwarding-snapshots", forwardingUpload, async (request, response) => {
+    try {
+      let snapshot;
+      if (Buffer.isBuffer(request.body)) {
+        if (request.body.byteLength === 0) return void response.status(400).json({ error: "XLSX 内容不能为空" });
+        snapshot = await store.importForwardingSnapshot(request.params.projectId, request.params.topologyId, request.body);
+      } else {
+        const files = (request.body as { files?: unknown })?.files;
+        if (!Array.isArray(files) || files.length === 0 || files.length > 50) return void response.status(400).json({ error: "请选择 1 至 50 个 XLSX 转发表文件" });
+        let totalBytes = 0;
+        const workbooks: Array<{ fileName: string; xlsxBytes: Buffer }> = [];
+        for (const file of files) {
+          const item = file as { name?: unknown; contentBase64?: unknown };
+          if (typeof item.name !== "string" || item.name.length === 0 || item.name.length > 240 || path.basename(item.name) !== item.name || !item.name.toLowerCase().endsWith(".xlsx")) {
+            return void response.status(400).json({ error: "转发表文件名无效或不是 XLSX 文件" });
+          }
+          if (typeof item.contentBase64 !== "string" || item.contentBase64.length === 0 || !/^[A-Za-z0-9+/]*={0,2}$/.test(item.contentBase64)) {
+            return void response.status(400).json({ error: `文件 ${item.name} 的内容编码无效` });
+          }
+          const xlsxBytes = Buffer.from(item.contentBase64, "base64");
+          totalBytes += xlsxBytes.byteLength;
+          if (xlsxBytes.byteLength === 0 || totalBytes > 24 * 1024 * 1024) return void response.status(400).json({ error: "转发表文件总大小不能超过 24 MiB" });
+          workbooks.push({ fileName: item.name, xlsxBytes });
+        }
+        snapshot = await store.importForwardingSnapshotBatch(request.params.projectId, request.params.topologyId, workbooks);
+      }
       response.status(201).json(snapshot);
     } catch (error) {
       if (error instanceof ForwardingWorkbookError) {

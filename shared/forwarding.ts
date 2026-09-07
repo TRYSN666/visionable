@@ -5,6 +5,11 @@ export type RouteAction = "forward" | "connected" | "local" | "drop" | "vxlan";
 export type MacAction = "interface" | "remote" | "drop";
 export type VxlanMode = "l2" | "l3";
 
+export interface ForwardingWorkbookLocation {
+  row: number;
+  sourceFile?: string;
+}
+
 export interface ForwardingMetadata {
   templateVersion: string;
   batchName: string;
@@ -12,8 +17,7 @@ export interface ForwardingMetadata {
   note?: string;
 }
 
-export interface ForwardingInterface {
-  row: number;
+export interface ForwardingInterface extends ForwardingWorkbookLocation {
   deviceId: string;
   deviceName: string;
   interfaceName: string;
@@ -27,8 +31,7 @@ export interface ForwardingInterface {
   status: ForwardingStatus;
 }
 
-export interface ForwardingLagMember {
-  row: number;
+export interface ForwardingLagMember extends ForwardingWorkbookLocation {
   deviceId: string;
   deviceName: string;
   aggregateInterface: string;
@@ -36,8 +39,7 @@ export interface ForwardingLagMember {
   status: ForwardingStatus;
 }
 
-export interface ForwardingRoute {
-  row: number;
+export interface ForwardingRoute extends ForwardingWorkbookLocation {
   deviceId: string;
   deviceName: string;
   vrf: string;
@@ -50,8 +52,7 @@ export interface ForwardingRoute {
   remoteVtep?: string;
 }
 
-export interface ForwardingArp {
-  row: number;
+export interface ForwardingArp extends ForwardingWorkbookLocation {
   deviceId: string;
   deviceName: string;
   vrf: string;
@@ -61,8 +62,7 @@ export interface ForwardingArp {
   status: "reachable" | "stale" | "static" | "incomplete";
 }
 
-export interface ForwardingMac {
-  row: number;
+export interface ForwardingMac extends ForwardingWorkbookLocation {
   deviceId: string;
   deviceName: string;
   vlan: number;
@@ -73,8 +73,7 @@ export interface ForwardingMac {
   remoteVtep?: string;
 }
 
-export interface ForwardingVxlan {
-  row: number;
+export interface ForwardingVxlan extends ForwardingWorkbookLocation {
   deviceId: string;
   deviceName: string;
   vni: number;
@@ -95,6 +94,53 @@ export interface ForwardingSnapshotData {
   arpEntries: ForwardingArp[];
   macEntries: ForwardingMac[];
   vxlanEntries: ForwardingVxlan[];
+}
+
+function normalizedForwardingValue(value: string): string {
+  return value.trim().toLowerCase();
+}
+
+function injectionPortCarriesVlan(port: ForwardingInterface, vlan: number | undefined): vlan is number {
+  if (vlan === undefined) return false;
+  if (port.forwardingMode === "access") return port.vlan === vlan;
+  if (port.forwardingMode === "trunk") return port.allowedVlans.includes(vlan);
+  return false;
+}
+
+function uniqueInjectionContexts(items: ForwardingInterface[]): ForwardingInterface[] {
+  const result = new Map<string, ForwardingInterface>();
+  for (const item of items) {
+    const key = `${normalizedForwardingValue(item.interfaceName)}\0${normalizedForwardingValue(item.vrf)}\0${item.vlan ?? ""}`;
+    if (!result.has(key)) result.set(key, item);
+  }
+  return [...result.values()];
+}
+
+/** Resolve the VLAN/VRF in which traffic entering a physical or LAG port is actually forwarded. */
+export function resolveForwardingInjectionInterfaces(data: ForwardingSnapshotData, deviceId: string, interfaceName: string, sourceIp?: string): ForwardingInterface[] {
+  const ports = data.interfaces.filter((item) => item.deviceId === deviceId && item.status === "up" && normalizedForwardingValue(item.interfaceName) === normalizedForwardingValue(interfaceName));
+  const contexts = ports.flatMap((port): ForwardingInterface[] => {
+    if (port.forwardingMode === "routed") return [{ ...port, vlan: undefined }];
+
+    const sourceArpContexts = sourceIp ? data.arpEntries.flatMap((arp): ForwardingInterface[] => {
+      if (arp.deviceId !== deviceId || arp.ip !== sourceIp || arp.status === "incomplete") return [];
+      const arpInterface = data.interfaces.find((item) => item.deviceId === deviceId && item.status === "up" && normalizedForwardingValue(item.interfaceName) === normalizedForwardingValue(arp.interfaceName));
+      if (!injectionPortCarriesVlan(port, arpInterface?.vlan)) return [];
+      return [{ ...port, vrf: arp.vrf, vlan: arpInterface.vlan }];
+    }) : [];
+    if (sourceArpContexts.length > 0) return sourceArpContexts;
+
+    const vlanInterfaceContexts = data.interfaces
+      .filter((item) => item.deviceId === deviceId && item.status === "up" && item.forwardingMode === "routed" && injectionPortCarriesVlan(port, item.vlan))
+      .map((item) => ({ ...port, vrf: item.vrf, vlan: item.vlan }));
+    if (vlanInterfaceContexts.length > 0) return vlanInterfaceContexts;
+
+    const vxlanContexts = data.vxlanEntries
+      .filter((item) => item.deviceId === deviceId && item.status === "up" && item.mode === "l2" && item.tenantVrf && injectionPortCarriesVlan(port, item.vlan))
+      .map((item) => ({ ...port, vrf: item.tenantVrf!, vlan: item.vlan }));
+    return vxlanContexts.length > 0 ? vxlanContexts : [port];
+  });
+  return uniqueInjectionContexts(contexts);
 }
 
 export interface ForwardingSnapshotSummary {
@@ -119,6 +165,7 @@ export interface ForwardingSnapshotSummary {
 }
 
 export interface ForwardingImportIssue {
+  sourceFile?: string;
   sheet: string;
   row: number;
   column: string;
@@ -159,6 +206,7 @@ export interface ForwardingTraceState {
   packet: AbstractPacket;
   summary: string;
   evidence?: Array<{
+    sourceFile?: string;
     sheet: string;
     row: number;
     description: string;

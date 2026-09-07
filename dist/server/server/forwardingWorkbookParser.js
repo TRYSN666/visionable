@@ -2,7 +2,8 @@ import { isIP } from "node:net";
 import { Readable } from "node:stream";
 import readXlsxFile from "read-excel-file/node";
 const MAX_FORWARDING_WORKBOOK_SIZE = 24 * 1024 * 1024;
-const REQUIRED_SHEETS = ["说明", "元数据", "接口属性", "聚合成员", "路由表", "ARP表", "MAC表", "VXLAN"];
+const DEFINED_SHEETS = ["说明", "元数据", "接口属性", "聚合成员", "路由表", "ARP表", "MAC表", "VXLAN"];
+const REQUIRED_SHEETS = ["说明", "元数据", "接口属性", "聚合成员", "路由表", "VXLAN"];
 const HEADERS = {
     元数据: ["模板版本", "批次名称", "采集时间", "备注"],
     接口属性: ["设备", "接口", "接口类型", "转发模式", "VRF", "VLAN", "允许VLAN", "Bridge", "接口MAC", "状态"],
@@ -29,9 +30,9 @@ function text(value) {
 function normalized(value) {
     return value.trim().toLowerCase().replace(/[\s_-]+/g, "");
 }
-function addIssue(issues, sheet, row, column, message) {
+function addIssue(issues, sheet, row, column, message, sourceFile) {
     if (issues.length < 1000)
-        issues.push({ sheet, row, column, message });
+        issues.push({ sourceFile, sheet, row, column, message });
 }
 function canonicalMac(value) {
     const compact = value.trim().toLowerCase().replace(/[.:-]/g, "");
@@ -41,6 +42,9 @@ function canonicalMac(value) {
 }
 function ipv4(value) {
     return isIP(value) === 4 ? value : undefined;
+}
+function ipAddress(value) {
+    return isIP(value) !== 0 ? value : undefined;
 }
 function ipv4Cidr(value) {
     const parts = value.split("/");
@@ -97,7 +101,15 @@ const MAC_ACTIONS = {
 };
 const VXLAN_MODES = { l2: "l2", l2vni: "l2", 二层: "l2", l3: "l3", l3vni: "l3", 三层: "l3" };
 function buildDeviceIndex(topology) {
-    const byName = new Map(topology.nodes.flatMap((node) => [[normalized(node.hostname), node], [normalized(node.id), node]]));
+    const byName = new Map();
+    for (const node of topology.nodes) {
+        for (const alias of new Set([node.id, node.hostname, node.label].map(normalized).filter(Boolean))) {
+            const matches = byName.get(alias) ?? [];
+            if (!matches.some((item) => item.id === node.id))
+                matches.push(node);
+            byName.set(alias, matches);
+        }
+    }
     const interfaces = new Map();
     for (const node of topology.nodes)
         interfaces.set(node.id, new Set(node.interfaces.map((item) => normalized(item.name))));
@@ -112,10 +124,16 @@ function resolveDevice(value, row, sheet, issues, devices) {
         addIssue(issues, sheet, row, "设备", "设备不能为空");
         return undefined;
     }
-    const device = devices.byName.get(normalized(value));
-    if (!device)
+    const matches = devices.byName.get(normalized(value)) ?? [];
+    if (matches.length === 0) {
         addIssue(issues, sheet, row, "设备", `拓扑中不存在设备 ${value}`);
-    return device;
+        return undefined;
+    }
+    if (matches.length > 1) {
+        addIssue(issues, sheet, row, "设备", `设备名 ${value} 在拓扑中匹配到多个设备，请改用唯一主机名`);
+        return undefined;
+    }
+    return matches[0];
 }
 function verifyInterface(device, value, row, sheet, column, issues, devices, required = true) {
     if (!value) {
@@ -123,10 +141,11 @@ function verifyInterface(device, value, row, sheet, column, issues, devices, req
             addIssue(issues, sheet, row, column, `${column}不能为空`);
         return !required;
     }
-    if (device && !devices.interfaces.get(device.id)?.has(normalized(value))) {
-        addIssue(issues, sheet, row, column, `设备 ${device.hostname} 上不存在接口 ${value}`);
-        return false;
-    }
+    // Forwarding exports can contain ports that were absent from the topology source.
+    // They are installed on the resolved device only after the whole workbook passes
+    // validation, so a failed import still leaves the topology untouched.
+    void device;
+    void devices;
     return true;
 }
 function rowsFor(sheet, name, issues) {
@@ -243,8 +262,8 @@ function parseRoutes(sheet, issues, devices) {
             addIssue(issues, "路由表", row, "目的网段", "目的网段必须是 IPv4 CIDR");
         if (!action)
             addIssue(issues, "路由表", row, "动作", "动作必须为 forward、connected、local、drop 或 vxlan");
-        if (value["下一跳"] && !ipv4(value["下一跳"]))
-            addIssue(issues, "路由表", row, "下一跳", "下一跳必须是 IPv4 地址");
+        if (value["下一跳"] && !ipAddress(value["下一跳"]))
+            addIssue(issues, "路由表", row, "下一跳", "下一跳必须是 IPv4 或 IPv6 地址");
         if (value["远端VTEP"] && !ipv4(value["远端VTEP"]))
             addIssue(issues, "路由表", row, "远端VTEP", "远端VTEP必须是 IPv4 地址");
         const vni = value["VNI"] ? integer(value["VNI"], 1, 16_777_215) : undefined;
@@ -276,18 +295,44 @@ function parseRoutes(sheet, issues, devices) {
     }
     return result;
 }
+function arpKey(entry) {
+    return `${entry.deviceId}\0${normalized(entry.vrf)}\0${entry.ip}`;
+}
+function deduplicateArpEntries(entries) {
+    const groups = new Map();
+    for (const entry of entries) {
+        const key = arpKey(entry);
+        const group = groups.get(key);
+        if (group)
+            group.push(entry);
+        else
+            groups.set(key, [entry]);
+    }
+    return [...groups.values()].flatMap((group) => {
+        if (group.length === 1)
+            return group;
+        const preferred = group.find((entry) => entry.status === "static")
+            ?? group.find((entry) => entry.status === "reachable");
+        return preferred ? [preferred] : [];
+    });
+}
 function parseArp(sheet, issues, devices) {
     const result = [];
-    const keys = new Set();
+    if (sheet.data.length === 0)
+        return result;
     for (const { row, value } of rowsFor(sheet, "ARP表", issues)) {
+        // Neighbor tables are observational data and can be truncated while being
+        // collected. Ignore partial rows; complete rows remain strictly validated.
+        if (["设备", "VRF", "IP", "MAC", "接口", "状态"].some((column) => !value[column]))
+            continue;
         const device = resolveDevice(value["设备"], row, "ARP表", issues, devices);
         if (!value["VRF"])
             addIssue(issues, "ARP表", row, "VRF", "VRF不能为空");
-        const ip = ipv4(value["IP"]);
+        const ip = ipAddress(value["IP"]);
         const mac = canonicalMac(value["MAC"]);
         const status = enumValue(value["状态"], ARP_STATUS);
         if (!ip)
-            addIssue(issues, "ARP表", row, "IP", "IP必须是 IPv4 地址");
+            addIssue(issues, "ARP表", row, "IP", "IP必须是 IPv4 或 IPv6 地址");
         if (!mac)
             addIssue(issues, "ARP表", row, "MAC", "MAC格式无效");
         if (!status)
@@ -295,22 +340,28 @@ function parseArp(sheet, issues, devices) {
         verifyInterface(device, value["接口"], row, "ARP表", "接口", issues, devices);
         if (!device || !ip || !mac || !status)
             continue;
-        const key = `${device.id}\0${normalized(value["VRF"])}\0${ip}`;
-        if (keys.has(key))
-            addIssue(issues, "ARP表", row, "IP", "同一设备和 VRF 的 ARP IP 重复");
-        keys.add(key);
         result.push({ row, deviceId: device.id, deviceName: device.hostname, vrf: value["VRF"], ip, mac, interfaceName: value["接口"], status });
     }
-    return result;
+    return deduplicateArpEntries(result);
 }
 function parseMac(sheet, issues, devices) {
     const result = [];
     const keys = new Set();
+    if (sheet.data.length === 0)
+        return result;
     for (const { row, value } of rowsFor(sheet, "MAC表", issues)) {
+        // FDB collection can also end mid-row. A partial entry cannot participate
+        // in forwarding, so omit it without rejecting the otherwise usable batch.
+        if (["设备", "VLAN", "MAC", "动作"].some((column) => !value[column]))
+            continue;
+        const action = enumValue(value["动作"], MAC_ACTIONS);
+        if (action === "interface" && !value["出接口"])
+            continue;
+        if (action === "remote" && (!value["VNI"] || !value["远端VTEP"]))
+            continue;
         const device = resolveDevice(value["设备"], row, "MAC表", issues, devices);
         const vlan = integer(value["VLAN"], 1, 4094);
         const mac = canonicalMac(value["MAC"]);
-        const action = enumValue(value["动作"], MAC_ACTIONS);
         if (vlan === undefined)
             addIssue(issues, "MAC表", row, "VLAN", "VLAN 必须是 1 至 4094 的整数");
         if (!mac)
@@ -324,9 +375,7 @@ function parseMac(sheet, issues, devices) {
             addIssue(issues, "MAC表", row, "远端VTEP", "远端VTEP必须是 IPv4 地址");
         if (action === "interface")
             verifyInterface(device, value["出接口"], row, "MAC表", "出接口", issues, devices);
-        if (action === "remote" && (vni === undefined || !value["远端VTEP"]))
-            addIssue(issues, "MAC表", row, "VNI", "远端 MAC 必须填写 VNI 和远端VTEP");
-        if (!device || vlan === undefined || !mac || !action)
+        if (!device || vlan === undefined || !mac || !action || (action === "remote" && vni === undefined))
             continue;
         const key = `${device.id}\0${vlan}\0${mac}`;
         if (keys.has(key))
@@ -382,55 +431,42 @@ function validateReferences(data, issues) {
         const aggregate = interfaces.get(`${member.deviceId}\0${normalized(member.aggregateInterface)}`);
         const physical = interfaces.get(`${member.deviceId}\0${normalized(member.memberInterface)}`);
         if (!aggregate || aggregate.interfaceType !== "lag")
-            addIssue(issues, "聚合成员", member.row, "聚合接口", "聚合接口必须在接口属性中定义为 lag");
+            addIssue(issues, "聚合成员", member.row, "聚合接口", "聚合接口必须在接口属性中定义为 lag", member.sourceFile);
         if (!physical || physical.interfaceType !== "physical")
-            addIssue(issues, "聚合成员", member.row, "成员接口", "成员接口必须在接口属性中定义为 physical");
+            addIssue(issues, "聚合成员", member.row, "成员接口", "成员接口必须在接口属性中定义为 physical", member.sourceFile);
     }
     for (const route of data.routes) {
         if (route.outputInterface && !interfaces.has(`${route.deviceId}\0${normalized(route.outputInterface)}`))
-            addIssue(issues, "路由表", route.row, "出接口", "出接口必须在接口属性中定义");
+            addIssue(issues, "路由表", route.row, "出接口", "出接口必须在接口属性中定义", route.sourceFile);
     }
     for (const arp of data.arpEntries) {
         if (!interfaces.has(`${arp.deviceId}\0${normalized(arp.interfaceName)}`))
-            addIssue(issues, "ARP表", arp.row, "接口", "接口必须在接口属性中定义");
+            addIssue(issues, "ARP表", arp.row, "接口", "接口必须在接口属性中定义", arp.sourceFile);
     }
     for (const mac of data.macEntries) {
         if (mac.outputInterface && !interfaces.has(`${mac.deviceId}\0${normalized(mac.outputInterface)}`))
-            addIssue(issues, "MAC表", mac.row, "出接口", "出接口必须在接口属性中定义");
+            addIssue(issues, "MAC表", mac.row, "出接口", "出接口必须在接口属性中定义", mac.sourceFile);
     }
     for (const route of data.routes.filter((item) => item.action === "vxlan")) {
         const mapping = route.vni === undefined ? undefined : vxlans.get(`${route.deviceId}\0${route.vni}`);
         if (!mapping || mapping.mode !== "l3" || mapping.status !== "up")
-            addIssue(issues, "路由表", route.row, "VNI", "VXLAN 路由必须引用本设备已启用的 L3VNI");
-        else if (!data.vxlanEntries.some((item) => item.deviceId !== route.deviceId && item.mode === "l3" && item.vni === route.vni && item.localVtep === route.remoteVtep && item.status === "up"))
-            addIssue(issues, "路由表", route.row, "远端VTEP", "远端VTEP必须引用其他设备上同 VNI 的已启用 L3VNI");
-    }
-    for (const mac of data.macEntries.filter((item) => item.action === "remote")) {
-        const mapping = mac.vni === undefined ? undefined : vxlans.get(`${mac.deviceId}\0${mac.vni}`);
-        if (!mapping || mapping.mode !== "l2" || mapping.vlan !== mac.vlan || mapping.status !== "up")
-            addIssue(issues, "MAC表", mac.row, "VNI", "远端 MAC 必须引用本设备同 VLAN 的 L2VNI");
-        else if (!data.vxlanEntries.some((item) => item.deviceId !== mac.deviceId && item.mode === "l2" && item.vni === mac.vni && item.localVtep === mac.remoteVtep && item.status === "up"))
-            addIssue(issues, "MAC表", mac.row, "远端VTEP", "远端VTEP必须引用其他设备上同 VNI 的已启用 L2VNI");
-    }
-    for (const vxlan of data.vxlanEntries) {
-        if (vxlan.status !== "up")
-            continue;
-        const duplicateLocal = data.vxlanEntries.find((item) => item !== vxlan && item.deviceId !== vxlan.deviceId && item.localVtep === vxlan.localVtep);
-        if (duplicateLocal)
-            addIssue(issues, "VXLAN", vxlan.row, "本端VTEP", `本端VTEP与设备 ${duplicateLocal.deviceName} 重复`);
+            addIssue(issues, "路由表", route.row, "VNI", "VXLAN 路由必须引用本设备已启用的 L3VNI", route.sourceFile);
     }
 }
-export async function parseForwardingWorkbook(xlsxBytes, topology) {
+function attachSourceFile(items, sourceFile) {
+    return sourceFile ? items.map((item) => ({ ...item, sourceFile })) : items;
+}
+async function parseWorkbookPart(xlsxBytes, topology, sourceFile, checkReferences = true) {
     if (xlsxBytes.byteLength === 0)
-        throw new ForwardingWorkbookError([{ sheet: "工作簿", row: 0, column: "文件", message: "XLSX 内容不能为空" }]);
+        throw new ForwardingWorkbookError([{ sourceFile, sheet: "工作簿", row: 0, column: "文件", message: "XLSX 内容不能为空" }]);
     if (xlsxBytes.byteLength > MAX_FORWARDING_WORKBOOK_SIZE)
-        throw new ForwardingWorkbookError([{ sheet: "工作簿", row: 0, column: "文件", message: "XLSX 超过 24 MiB 限制" }]);
+        throw new ForwardingWorkbookError([{ sourceFile, sheet: "工作簿", row: 0, column: "文件", message: "XLSX 超过 24 MiB 限制" }]);
     let sheets;
     try {
         sheets = await readXlsxFile(Readable.from([xlsxBytes]));
     }
     catch (error) {
-        throw new ForwardingWorkbookError([{ sheet: "工作簿", row: 0, column: "文件", message: error instanceof Error ? `XLSX 解析失败：${error.message}` : "XLSX 解析失败" }]);
+        throw new ForwardingWorkbookError([{ sourceFile, sheet: "工作簿", row: 0, column: "文件", message: error instanceof Error ? `XLSX 解析失败：${error.message}` : "XLSX 解析失败" }]);
     }
     const issues = [];
     const byName = new Map(sheets.map((sheet) => [sheet.sheet, sheet]));
@@ -438,22 +474,95 @@ export async function parseForwardingWorkbook(xlsxBytes, topology) {
         if (!byName.has(name))
             addIssue(issues, name, 0, "Sheet", `缺少 Sheet“${name}”`);
     for (const sheet of sheets)
-        if (!REQUIRED_SHEETS.includes(sheet.sheet))
+        if (!DEFINED_SHEETS.includes(sheet.sheet))
             addIssue(issues, sheet.sheet, 0, "Sheet", `存在未定义 Sheet“${sheet.sheet}”`);
     const emptySheet = (name) => ({ sheet: name, data: [] });
     const devices = buildDeviceIndex(topology);
     const data = {
         metadata: parseMetadata(byName.get("元数据") ?? emptySheet("元数据"), issues),
-        interfaces: parseInterfaces(byName.get("接口属性") ?? emptySheet("接口属性"), issues, devices),
-        lagMembers: parseLagMembers(byName.get("聚合成员") ?? emptySheet("聚合成员"), issues, devices),
-        routes: parseRoutes(byName.get("路由表") ?? emptySheet("路由表"), issues, devices),
-        arpEntries: parseArp(byName.get("ARP表") ?? emptySheet("ARP表"), issues, devices),
-        macEntries: parseMac(byName.get("MAC表") ?? emptySheet("MAC表"), issues, devices),
-        vxlanEntries: parseVxlan(byName.get("VXLAN") ?? emptySheet("VXLAN"), issues, devices),
+        interfaces: attachSourceFile(parseInterfaces(byName.get("接口属性") ?? emptySheet("接口属性"), issues, devices), sourceFile),
+        lagMembers: attachSourceFile(parseLagMembers(byName.get("聚合成员") ?? emptySheet("聚合成员"), issues, devices), sourceFile),
+        routes: attachSourceFile(parseRoutes(byName.get("路由表") ?? emptySheet("路由表"), issues, devices), sourceFile),
+        arpEntries: attachSourceFile(parseArp(byName.get("ARP表") ?? emptySheet("ARP表"), issues, devices), sourceFile),
+        macEntries: attachSourceFile(parseMac(byName.get("MAC表") ?? emptySheet("MAC表"), issues, devices), sourceFile),
+        vxlanEntries: attachSourceFile(parseVxlan(byName.get("VXLAN") ?? emptySheet("VXLAN"), issues, devices), sourceFile),
     };
-    validateReferences(data, issues);
+    if (checkReferences)
+        validateReferences(data, issues);
     if (issues.length > 0)
-        throw new ForwardingWorkbookError(issues);
+        throw new ForwardingWorkbookError(issues.map((issue) => ({ ...issue, sourceFile: issue.sourceFile ?? sourceFile })));
     return data;
+}
+function validateMergedDuplicates(data, issues) {
+    const flagDuplicates = (items, keyFor, sheet, column, message) => {
+        const seen = new Set();
+        for (const item of items) {
+            const key = keyFor(item);
+            if (seen.has(key))
+                addIssue(issues, sheet, item.row, column, message, item.sourceFile);
+            seen.add(key);
+        }
+    };
+    flagDuplicates(data.interfaces, (item) => `${item.deviceId}\0${normalized(item.interfaceName)}`, "接口属性", "接口", "同一设备接口在多个文件中重复定义");
+    flagDuplicates(data.lagMembers, (item) => `${item.deviceId}\0${normalized(item.aggregateInterface)}\0${normalized(item.memberInterface)}`, "聚合成员", "成员接口", "聚合成员在多个文件中重复定义");
+    flagDuplicates(data.macEntries, (item) => `${item.deviceId}\0${item.vlan}\0${item.mac}`, "MAC表", "MAC", "同一设备和 VLAN 的 MAC 在多个文件中重复");
+    flagDuplicates(data.vxlanEntries, (item) => `${item.deviceId}\0${item.vni}`, "VXLAN", "VNI", "同一设备的 VNI 在多个文件中重复");
+    const routesByPrefix = new Map();
+    for (const route of data.routes) {
+        const key = `${route.deviceId}\0${normalized(route.vrf)}\0${route.destinationCidr}`;
+        routesByPrefix.set(key, [...(routesByPrefix.get(key) ?? []), route]);
+    }
+    for (const routes of routesByPrefix.values()) {
+        if (routes.length <= 1)
+            continue;
+        const groups = new Set(routes.map((route) => route.ecmpGroup).filter(Boolean));
+        if (groups.size !== 1 || routes.some((route) => !route.ecmpGroup)) {
+            for (const route of routes)
+                addIssue(issues, "路由表", route.row, "ECMP组", "同设备、VRF和前缀的多条路由必须属于同一个非空 ECMP 组", route.sourceFile);
+        }
+    }
+}
+export async function parseForwardingWorkbook(xlsxBytes, topology) {
+    return parseWorkbookPart(xlsxBytes, topology);
+}
+export async function parseForwardingWorkbooks(workbooks, topology) {
+    if (workbooks.length === 0)
+        throw new ForwardingWorkbookError([{ sheet: "工作簿", row: 0, column: "文件", message: "至少选择一个 XLSX 文件" }]);
+    const parts = [];
+    const issues = [];
+    for (const workbook of workbooks) {
+        try {
+            parts.push(await parseWorkbookPart(workbook.xlsxBytes, topology, workbook.fileName, false));
+        }
+        catch (error) {
+            if (error instanceof ForwardingWorkbookError)
+                issues.push(...error.issues);
+            else
+                throw error;
+        }
+    }
+    if (issues.length > 0)
+        throw new ForwardingWorkbookError(issues.slice(0, 1000));
+    const first = parts[0];
+    const batchNames = [...new Set(parts.map((part) => part.metadata.batchName))];
+    const merged = {
+        metadata: {
+            templateVersion: first.metadata.templateVersion,
+            batchName: (batchNames.length === 1 ? batchNames[0] : `${batchNames[0]} 等 ${parts.length} 份`).slice(0, 120),
+            collectedAt: parts.map((part) => part.metadata.collectedAt).sort().at(-1) ?? first.metadata.collectedAt,
+            note: parts.length === 1 ? first.metadata.note : `合并导入：${workbooks.map((item) => item.fileName).join("、")}`,
+        },
+        interfaces: parts.flatMap((part) => part.interfaces),
+        lagMembers: parts.flatMap((part) => part.lagMembers),
+        routes: parts.flatMap((part) => part.routes),
+        arpEntries: deduplicateArpEntries(parts.flatMap((part) => part.arpEntries)),
+        macEntries: parts.flatMap((part) => part.macEntries),
+        vxlanEntries: parts.flatMap((part) => part.vxlanEntries),
+    };
+    validateMergedDuplicates(merged, issues);
+    validateReferences(merged, issues);
+    if (issues.length > 0)
+        throw new ForwardingWorkbookError(issues.slice(0, 1000));
+    return merged;
 }
 //# sourceMappingURL=forwardingWorkbookParser.js.map

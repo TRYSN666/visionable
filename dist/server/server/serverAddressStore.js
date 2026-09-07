@@ -61,6 +61,16 @@ export class ServerAddressStore {
       ) STRICT
     `);
         this.database.exec(`
+      CREATE TABLE IF NOT EXISTS topology_installed_interfaces (
+        topology_id TEXT NOT NULL REFERENCES topology_catalog(id) ON DELETE CASCADE,
+        device_id TEXT NOT NULL,
+        interface_name TEXT NOT NULL COLLATE NOCASE,
+        logical INTEGER NOT NULL CHECK(logical IN (0, 1)),
+        created_at TEXT NOT NULL,
+        PRIMARY KEY(topology_id, device_id, interface_name)
+      ) STRICT
+    `);
+        this.database.exec(`
       INSERT OR IGNORE INTO topology_layout_positions_v2 (topology_id, node_id, x, y, updated_at)
       SELECT 'metta-roce', node_id, x, y, updated_at FROM topology_layout_positions
     `);
@@ -186,6 +196,11 @@ export class ServerAddressStore {
       ) STRICT
     `);
         for (const table of ["forwarding_interfaces", "forwarding_lag_members", "forwarding_routes", "forwarding_arp_entries", "forwarding_mac_entries", "forwarding_vxlan_entries"]) {
+            const columns = new Set(this.database.prepare(`PRAGMA table_info(${table})`).all().map((column) => column.name));
+            if (!columns.has("source_file"))
+                this.database.exec(`ALTER TABLE ${table} ADD COLUMN source_file TEXT`);
+            if (!columns.has("source_row"))
+                this.database.exec(`ALTER TABLE ${table} ADD COLUMN source_row INTEGER`);
             this.database.exec(`CREATE INDEX IF NOT EXISTS idx_${table}_snapshot_device ON ${table}(topology_id, snapshot_id, device_id)`);
         }
         this.database.exec("PRAGMA optimize");
@@ -308,7 +323,16 @@ export class ServerAddressStore {
             throw error;
         }
     }
-    saveForwardingSnapshot(topologyId, topologyFingerprint, data) {
+    installedTopologyInterfaces(topologyId) {
+        const rows = this.database.prepare(`
+      SELECT device_id, interface_name, logical
+      FROM topology_installed_interfaces
+      WHERE topology_id = ?
+      ORDER BY device_id, interface_name
+    `).all(topologyId);
+        return rows.map((row) => ({ deviceId: row.device_id, interfaceName: row.interface_name, logical: row.logical === 1 }));
+    }
+    saveForwardingSnapshot(topologyId, topologyFingerprint, data, installedInterfaces = []) {
         const id = `forwarding-${randomUUID()}`;
         const importedAt = new Date().toISOString();
         const counts = {
@@ -320,43 +344,64 @@ export class ServerAddressStore {
             vxlanEntries: data.vxlanEntries.length,
         };
         const insertInterface = this.database.prepare(`
-      INSERT INTO forwarding_interfaces VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO forwarding_interfaces
+        (topology_id, snapshot_id, row_number, device_id, device_name, interface_name, interface_type, forwarding_mode, vrf, vlan, allowed_vlans_json, bridge, mac, status, source_file, source_row)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
         const insertLag = this.database.prepare(`
-      INSERT INTO forwarding_lag_members VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO forwarding_lag_members
+        (topology_id, snapshot_id, row_number, device_id, device_name, aggregate_interface, member_interface, status, source_file, source_row)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
         const insertRoute = this.database.prepare(`
-      INSERT INTO forwarding_routes VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO forwarding_routes
+        (topology_id, snapshot_id, row_number, device_id, device_name, vrf, destination_cidr, action, next_hop, output_interface, ecmp_group, vni, remote_vtep, source_file, source_row)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
         const insertArp = this.database.prepare(`
-      INSERT INTO forwarding_arp_entries VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO forwarding_arp_entries
+        (topology_id, snapshot_id, row_number, device_id, device_name, vrf, ip, mac, interface_name, status, source_file, source_row)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
         const insertMac = this.database.prepare(`
-      INSERT INTO forwarding_mac_entries VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO forwarding_mac_entries
+        (topology_id, snapshot_id, row_number, device_id, device_name, vlan, mac, action, output_interface, vni, remote_vtep, source_file, source_row)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
         const insertVxlan = this.database.prepare(`
-      INSERT INTO forwarding_vxlan_entries VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO forwarding_vxlan_entries
+        (topology_id, snapshot_id, row_number, device_id, device_name, vni, mode, local_vtep, vlan, tenant_vrf, underlay_vrf, udp_destination_port, status, source_file, source_row)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+        const installInterface = this.database.prepare(`
+      INSERT INTO topology_installed_interfaces
+        (topology_id, device_id, interface_name, logical, created_at)
+      VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT(topology_id, device_id, interface_name) DO UPDATE SET
+        logical = excluded.logical
     `);
         this.database.exec("BEGIN IMMEDIATE");
         try {
+            for (const item of installedInterfaces)
+                installInterface.run(topologyId, item.deviceId, item.interfaceName, item.logical ? 1 : 0, importedAt);
             this.database.prepare("UPDATE forwarding_snapshots SET is_default = 0 WHERE topology_id = ?").run(topologyId);
             this.database.prepare(`
         INSERT INTO forwarding_snapshots
           (id, topology_id, template_version, batch_name, collected_at, imported_at, note, topology_fingerprint, is_default, counts_json)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
       `).run(id, topologyId, data.metadata.templateVersion, data.metadata.batchName, data.metadata.collectedAt, importedAt, data.metadata.note ?? null, topologyFingerprint, JSON.stringify(counts));
-            for (const item of data.interfaces)
-                insertInterface.run(topologyId, id, item.row, item.deviceId, item.deviceName, item.interfaceName, item.interfaceType, item.forwardingMode, item.vrf, item.vlan ?? null, JSON.stringify(item.allowedVlans), item.bridge ?? null, item.mac ?? null, item.status);
-            for (const item of data.lagMembers)
-                insertLag.run(topologyId, id, item.row, item.deviceId, item.deviceName, item.aggregateInterface, item.memberInterface, item.status);
-            for (const item of data.routes)
-                insertRoute.run(topologyId, id, item.row, item.deviceId, item.deviceName, item.vrf, item.destinationCidr, item.action, item.nextHop ?? null, item.outputInterface ?? null, item.ecmpGroup ?? null, item.vni ?? null, item.remoteVtep ?? null);
-            for (const item of data.arpEntries)
-                insertArp.run(topologyId, id, item.row, item.deviceId, item.deviceName, item.vrf, item.ip, item.mac, item.interfaceName, item.status);
-            for (const item of data.macEntries)
-                insertMac.run(topologyId, id, item.row, item.deviceId, item.deviceName, item.vlan, item.mac, item.action, item.outputInterface ?? null, item.vni ?? null, item.remoteVtep ?? null);
-            for (const item of data.vxlanEntries)
-                insertVxlan.run(topologyId, id, item.row, item.deviceId, item.deviceName, item.vni, item.mode, item.localVtep, item.vlan ?? null, item.tenantVrf ?? null, item.underlayVrf, item.udpDestinationPort, item.status);
+            for (const [index, item] of data.interfaces.entries())
+                insertInterface.run(topologyId, id, index + 1, item.deviceId, item.deviceName, item.interfaceName, item.interfaceType, item.forwardingMode, item.vrf, item.vlan ?? null, JSON.stringify(item.allowedVlans), item.bridge ?? null, item.mac ?? null, item.status, item.sourceFile ?? null, item.row);
+            for (const [index, item] of data.lagMembers.entries())
+                insertLag.run(topologyId, id, index + 1, item.deviceId, item.deviceName, item.aggregateInterface, item.memberInterface, item.status, item.sourceFile ?? null, item.row);
+            for (const [index, item] of data.routes.entries())
+                insertRoute.run(topologyId, id, index + 1, item.deviceId, item.deviceName, item.vrf, item.destinationCidr, item.action, item.nextHop ?? null, item.outputInterface ?? null, item.ecmpGroup ?? null, item.vni ?? null, item.remoteVtep ?? null, item.sourceFile ?? null, item.row);
+            for (const [index, item] of data.arpEntries.entries())
+                insertArp.run(topologyId, id, index + 1, item.deviceId, item.deviceName, item.vrf, item.ip, item.mac, item.interfaceName, item.status, item.sourceFile ?? null, item.row);
+            for (const [index, item] of data.macEntries.entries())
+                insertMac.run(topologyId, id, index + 1, item.deviceId, item.deviceName, item.vlan, item.mac, item.action, item.outputInterface ?? null, item.vni ?? null, item.remoteVtep ?? null, item.sourceFile ?? null, item.row);
+            for (const [index, item] of data.vxlanEntries.entries())
+                insertVxlan.run(topologyId, id, index + 1, item.deviceId, item.deviceName, item.vni, item.mode, item.localVtep, item.vlan ?? null, item.tenantVrf ?? null, item.underlayVrf, item.udpDestinationPort, item.status, item.sourceFile ?? null, item.row);
             const stale = this.database.prepare(`
         SELECT id FROM forwarding_snapshots WHERE topology_id = ? ORDER BY imported_at DESC, rowid DESC LIMIT -1 OFFSET 5
       `).all(topologyId);
@@ -408,12 +453,12 @@ export class ServerAddressStore {
         const vxlanEntries = this.database.prepare(`SELECT * FROM forwarding_vxlan_entries WHERE topology_id = ? AND snapshot_id = ? ORDER BY row_number`).all(topologyId, snapshotId);
         return {
             metadata: { templateVersion: row.template_version, batchName: row.batch_name, collectedAt: row.collected_at, note: row.note ?? undefined },
-            interfaces: interfaces.map((item) => ({ row: item.row_number, deviceId: item.device_id, deviceName: item.device_name, interfaceName: item.interface_name, interfaceType: item.interface_type, forwardingMode: item.forwarding_mode, vrf: item.vrf, vlan: item.vlan == null ? undefined : item.vlan, allowedVlans: JSON.parse(item.allowed_vlans_json), bridge: item.bridge == null ? undefined : item.bridge, mac: item.mac == null ? undefined : item.mac, status: item.status })),
-            lagMembers: lagMembers.map((item) => ({ row: item.row_number, deviceId: item.device_id, deviceName: item.device_name, aggregateInterface: item.aggregate_interface, memberInterface: item.member_interface, status: item.status })),
-            routes: routes.map((item) => ({ row: item.row_number, deviceId: item.device_id, deviceName: item.device_name, vrf: item.vrf, destinationCidr: item.destination_cidr, action: item.action, nextHop: item.next_hop == null ? undefined : item.next_hop, outputInterface: item.output_interface == null ? undefined : item.output_interface, ecmpGroup: item.ecmp_group == null ? undefined : item.ecmp_group, vni: item.vni == null ? undefined : item.vni, remoteVtep: item.remote_vtep == null ? undefined : item.remote_vtep })),
-            arpEntries: arpEntries.map((item) => ({ row: item.row_number, deviceId: item.device_id, deviceName: item.device_name, vrf: item.vrf, ip: item.ip, mac: item.mac, interfaceName: item.interface_name, status: item.status })),
-            macEntries: macEntries.map((item) => ({ row: item.row_number, deviceId: item.device_id, deviceName: item.device_name, vlan: item.vlan, mac: item.mac, action: item.action, outputInterface: item.output_interface == null ? undefined : item.output_interface, vni: item.vni == null ? undefined : item.vni, remoteVtep: item.remote_vtep == null ? undefined : item.remote_vtep })),
-            vxlanEntries: vxlanEntries.map((item) => ({ row: item.row_number, deviceId: item.device_id, deviceName: item.device_name, vni: item.vni, mode: item.mode, localVtep: item.local_vtep, vlan: item.vlan == null ? undefined : item.vlan, tenantVrf: item.tenant_vrf == null ? undefined : item.tenant_vrf, underlayVrf: item.underlay_vrf, udpDestinationPort: item.udp_destination_port, status: item.status })),
+            interfaces: interfaces.map((item) => ({ row: (item.source_row ?? item.row_number), sourceFile: item.source_file == null ? undefined : item.source_file, deviceId: item.device_id, deviceName: item.device_name, interfaceName: item.interface_name, interfaceType: item.interface_type, forwardingMode: item.forwarding_mode, vrf: item.vrf, vlan: item.vlan == null ? undefined : item.vlan, allowedVlans: JSON.parse(item.allowed_vlans_json), bridge: item.bridge == null ? undefined : item.bridge, mac: item.mac == null ? undefined : item.mac, status: item.status })),
+            lagMembers: lagMembers.map((item) => ({ row: (item.source_row ?? item.row_number), sourceFile: item.source_file == null ? undefined : item.source_file, deviceId: item.device_id, deviceName: item.device_name, aggregateInterface: item.aggregate_interface, memberInterface: item.member_interface, status: item.status })),
+            routes: routes.map((item) => ({ row: (item.source_row ?? item.row_number), sourceFile: item.source_file == null ? undefined : item.source_file, deviceId: item.device_id, deviceName: item.device_name, vrf: item.vrf, destinationCidr: item.destination_cidr, action: item.action, nextHop: item.next_hop == null ? undefined : item.next_hop, outputInterface: item.output_interface == null ? undefined : item.output_interface, ecmpGroup: item.ecmp_group == null ? undefined : item.ecmp_group, vni: item.vni == null ? undefined : item.vni, remoteVtep: item.remote_vtep == null ? undefined : item.remote_vtep })),
+            arpEntries: arpEntries.map((item) => ({ row: (item.source_row ?? item.row_number), sourceFile: item.source_file == null ? undefined : item.source_file, deviceId: item.device_id, deviceName: item.device_name, vrf: item.vrf, ip: item.ip, mac: item.mac, interfaceName: item.interface_name, status: item.status })),
+            macEntries: macEntries.map((item) => ({ row: (item.source_row ?? item.row_number), sourceFile: item.source_file == null ? undefined : item.source_file, deviceId: item.device_id, deviceName: item.device_name, vlan: item.vlan, mac: item.mac, action: item.action, outputInterface: item.output_interface == null ? undefined : item.output_interface, vni: item.vni == null ? undefined : item.vni, remoteVtep: item.remote_vtep == null ? undefined : item.remote_vtep })),
+            vxlanEntries: vxlanEntries.map((item) => ({ row: (item.source_row ?? item.row_number), sourceFile: item.source_file == null ? undefined : item.source_file, deviceId: item.device_id, deviceName: item.device_name, vni: item.vni, mode: item.mode, localVtep: item.local_vtep, vlan: item.vlan == null ? undefined : item.vlan, tenantVrf: item.tenant_vrf == null ? undefined : item.tenant_vrf, underlayVrf: item.underlay_vrf, udpDestinationPort: item.udp_destination_port, status: item.status })),
         };
     }
     forwardingSnapshotFingerprint(topologyId, snapshotId) {

@@ -1,4 +1,5 @@
 import { isIP } from "node:net";
+import { resolveForwardingInjectionInterfaces } from "../shared/forwarding.js";
 const DEFAULT_VRF = "default";
 function norm(value) {
     return value.trim().toLowerCase();
@@ -46,21 +47,31 @@ function sourceInterfaces(topology, data, request) {
     const node = topology.nodes.find((item) => item.id === request.sourceDeviceId);
     if (!node)
         return [];
+    if (request.sourceInterface) {
+        return resolveForwardingInjectionInterfaces(data, node.id, request.sourceInterface, request.sourceIp).map((item) => ({
+            name: item.interfaceName,
+            vrf: item.vrf,
+            vlan: item.vlan,
+            row: item.row,
+            sourceFile: item.sourceFile,
+        }));
+    }
     const matchingTopologyInterfaces = node.interfaces.filter((item) => item.addresses.some((address) => address.cidr.split("/")[0] === request.sourceIp));
     let candidates = matchingTopologyInterfaces.flatMap((item) => {
         const attributes = data.interfaces.filter((attribute) => attribute.deviceId === node.id && norm(attribute.interfaceName) === norm(item.name) && attribute.status === "up");
-        return attributes.length > 0 ? attributes.map((attribute) => ({ name: item.name, vrf: attribute.vrf })) : [{ name: item.name, vrf: request.vrf ?? DEFAULT_VRF }];
+        const resolved = attributes.flatMap((attribute) => resolveForwardingInjectionInterfaces(data, node.id, attribute.interfaceName, request.sourceIp));
+        return resolved.length > 0
+            ? resolved.map((attribute) => ({ name: item.name, vrf: attribute.vrf, vlan: attribute.vlan, row: attribute.row, sourceFile: attribute.sourceFile }))
+            : [{ name: item.name, vrf: request.vrf ?? DEFAULT_VRF }];
     });
-    if (request.sourceInterface)
-        candidates = candidates.filter((item) => norm(item.name) === norm(request.sourceInterface));
     if (request.vrf)
         candidates = candidates.filter((item) => norm(item.vrf) === norm(request.vrf));
-    if (candidates.length === 0) {
+    if (candidates.length === 0 && request.vrf) {
         candidates = data.interfaces
-            .filter((item) => item.deviceId === node.id && item.status === "up" && (!request.sourceInterface || norm(item.interfaceName) === norm(request.sourceInterface)) && (!request.vrf || norm(item.vrf) === norm(request.vrf)))
-            .map((item) => ({ name: item.interfaceName, vrf: item.vrf }));
+            .filter((item) => item.deviceId === node.id && item.status === "up" && norm(item.vrf) === norm(request.vrf))
+            .map((item) => ({ name: item.interfaceName, vrf: item.vrf, vlan: item.forwardingMode === "routed" ? undefined : item.vlan, row: item.row, sourceFile: item.sourceFile }));
     }
-    const unique = new Map(candidates.map((item) => [`${norm(item.name)}\0${norm(item.vrf)}`, item]));
+    const unique = new Map(candidates.map((item) => [`${norm(item.name)}\0${norm(item.vrf)}\0${item.vlan ?? ""}`, item]));
     return [...unique.values()];
 }
 export function traceForwarding(topologyId, snapshotId, topology, data, request) {
@@ -89,9 +100,9 @@ export function traceForwarding(topologyId, snapshotId, topology, data, request)
         state.summary = message;
         endpoints.push({ stateId, deviceId, code, message });
     };
-    const evidence = (stateId, sheet, row, description) => {
+    const evidence = (stateId, sheet, row, description, sourceFile) => {
         const state = states.find((item) => item.id === stateId);
-        state.evidence = [...(state.evidence ?? []), { sheet, row, description }];
+        state.evidence = [...(state.evidence ?? []), { sourceFile, sheet, row, description }];
     };
     const interfaceAttribute = (deviceId, interfaceName) => data.interfaces.find((item) => item.deviceId === deviceId && norm(item.interfaceName) === norm(interfaceName));
     const physicalExits = (deviceId, interfaceName) => {
@@ -166,7 +177,7 @@ export function traceForwarding(topologyId, snapshotId, topology, data, request)
         const state = states.find((entry) => entry.id === item.stateId);
         state.kind = "encapsulate";
         state.packet = packetCopy(packet);
-        evidence(item.stateId, origin.sheet, origin.row, `${mode.toUpperCase()}VNI ${mapping.vni} 封装到 ${remoteVtep}`);
+        evidence(item.stateId, origin.sheet, origin.row, `${mode.toUpperCase()}VNI ${mapping.vni} 封装到 ${remoteVtep}`, origin.sourceFile);
         const underlay = routeCandidates(data, item.work.deviceId, mapping.underlayVrf, remoteVtep);
         if (underlay.length === 0) {
             terminate(item.stateId, item.work.deviceId, "VTEP_UNREACHABLE", `Underlay VRF ${mapping.underlayVrf} 中没有到远端 VTEP ${remoteVtep} 的路由`);
@@ -181,18 +192,18 @@ export function traceForwarding(topologyId, snapshotId, topology, data, request)
             terminate(item.stateId, item.work.deviceId, "NO_MAC", `VLAN ${vlan} 中没有目的 MAC ${mac} 的已知单播表项`);
             return;
         }
-        evidence(item.stateId, "MAC表", entry.row, `VLAN ${vlan} 的 ${mac} 命中 ${entry.action}`);
+        evidence(item.stateId, "MAC表", entry.row, `VLAN ${vlan} 的 ${mac} 命中 ${entry.action}`, entry.sourceFile);
         if (entry.action === "drop") {
             terminate(item.stateId, item.work.deviceId, "EXPLICIT_DROP", `MAC 表显式丢弃 ${mac}`);
             return;
         }
         if (entry.action === "remote") {
-            const mapping = entry.vni === undefined ? undefined : vxlanMapping(item.work.deviceId, entry.vni, "l2");
+            const mapping = entry.vni === undefined ? undefined : vxlanMapping(item.work.deviceId, entry.vni);
             if (!mapping || !entry.remoteVtep) {
-                terminate(item.stateId, item.work.deviceId, "NO_VXLAN", `缺少 VLAN ${vlan} 对应的 L2VNI 映射`);
+                terminate(item.stateId, item.work.deviceId, "NO_VXLAN", `缺少 VNI ${entry.vni ?? "(空)"} 对应的本地 VXLAN 映射`);
                 return;
             }
-            encapsulate(item, mapping, "l2", entry.remoteVtep, mac, { sheet: "MAC表", row: entry.row });
+            encapsulate(item, mapping, mapping.mode, entry.remoteVtep, mac, { sheet: "MAC表", row: entry.row, sourceFile: entry.sourceFile });
             return;
         }
         if (!entry.outputInterface) {
@@ -202,7 +213,7 @@ export function traceForwarding(topologyId, snapshotId, topology, data, request)
         enqueueExit(item, entry.outputInterface, { ...packetCopy(packet), vlan }, mac, `MAC ${mac} 从 ${entry.outputInterface} 转发`);
     };
     function forwardRoute(item, route, packet, destinationMac, outerLookup) {
-        evidence(item.stateId, "路由表", route.row, `${route.vrf} 中 ${route.destinationCidr} 命中 ${route.action}${route.ecmpGroup ? `（ECMP ${route.ecmpGroup}）` : ""}`);
+        evidence(item.stateId, "路由表", route.row, `${route.vrf} 中 ${route.destinationCidr} 命中 ${route.action}${route.ecmpGroup ? `（ECMP ${route.ecmpGroup}）` : ""}`, route.sourceFile);
         if (route.action === "drop") {
             terminate(item.stateId, item.work.deviceId, "EXPLICIT_DROP", `路由 ${route.destinationCidr} 显式丢弃`);
             return;
@@ -224,7 +235,7 @@ export function traceForwarding(topologyId, snapshotId, topology, data, request)
                 terminate(item.stateId, item.work.deviceId, "NO_VXLAN", `路由引用的 L3VNI ${route.vni ?? "(空)"} 不可用`);
                 return;
             }
-            encapsulate(item, mapping, "l3", route.remoteVtep, destinationMac, { sheet: "路由表", row: route.row });
+            encapsulate(item, mapping, "l3", route.remoteVtep, destinationMac, { sheet: "路由表", row: route.row, sourceFile: route.sourceFile });
             return;
         }
         if (!route.outputInterface) {
@@ -237,7 +248,7 @@ export function traceForwarding(topologyId, snapshotId, topology, data, request)
             terminate(item.stateId, item.work.deviceId, "NO_ARP", `${route.vrf} 中缺少下一跳 ${targetIp} 的可用 ARP`);
             return;
         }
-        evidence(item.stateId, "ARP表", arp.row, `${targetIp} 解析为 ${arp.mac}`);
+        evidence(item.stateId, "ARP表", arp.row, `${targetIp} 解析为 ${arp.mac}`, arp.sourceFile);
         const outputAttribute = interfaceAttribute(item.work.deviceId, route.outputInterface);
         const routedEgress = outputAttribute?.forwardingMode === "routed";
         if (routedEgress) {
@@ -253,13 +264,26 @@ export function traceForwarding(topologyId, snapshotId, topology, data, request)
         forwardMac(item, arp.mac, vlan, packet);
     }
     const choices = sourceInterfaces(topology, data, request);
-    const packet = { innerSourceIp: request.sourceIp, innerDestinationIp: request.destinationIp, vrf: request.vrf ?? choices[0]?.vrf ?? DEFAULT_VRF };
-    const rootWork = { deviceId: sourceNode.id, packet };
-    const rootStateId = createState(rootWork, "ingress", `从 ${sourceNode.hostname} 发起模拟流量`);
+    const sourceContext = choices[0];
+    const packet = { innerSourceIp: request.sourceIp, innerDestinationIp: request.destinationIp, vrf: sourceContext?.vrf ?? request.vrf ?? DEFAULT_VRF, vlan: sourceContext?.vlan };
+    const rootWork = { deviceId: sourceNode.id, ingressInterface: sourceContext?.name ?? request.sourceInterface, packet };
+    const rootSummary = sourceContext
+        ? `从 ${sourceNode.hostname} 的 ${sourceContext.name} 注入（VRF ${sourceContext.vrf}${sourceContext.vlan === undefined ? "" : `，VLAN ${sourceContext.vlan}`}）`
+        : `从 ${sourceNode.hostname} 发起模拟流量`;
+    const rootStateId = createState(rootWork, "ingress", rootSummary);
+    if (sourceContext?.row)
+        evidence(rootStateId, "接口属性", sourceContext.row, rootSummary, sourceContext.sourceFile);
     const rootKey = stateKey(rootWork);
     stateByKey.set(rootKey, rootStateId);
     queue.push({ stateId: rootStateId, work: rootWork, ancestors: new Set([rootKey]) });
-    if (choices.length > 1 && !request.sourceInterface && !request.vrf) {
+    if (choices.length === 0) {
+        const message = request.sourceInterface
+            ? `流量注入端口 ${request.sourceInterface} 不存在、未启用或不属于 VRF ${request.vrf ?? DEFAULT_VRF}`
+            : "源地址不属于设备接口，请指定流量注入端口";
+        terminate(rootStateId, sourceNode.id, "INVALID_STATE", message);
+        queue.length = 0;
+    }
+    else if (choices.length > 1 && !request.sourceInterface && !request.vrf) {
         terminate(rootStateId, sourceNode.id, "AMBIGUOUS_SOURCE", "源地址归属多个接口或 VRF，请补充源接口或 VRF");
         queue.length = 0;
     }
@@ -272,7 +296,7 @@ export function traceForwarding(topologyId, snapshotId, topology, data, request)
             const outer = packetAtDevice.vxlan;
             const local = data.vxlanEntries.find((entry) => entry.deviceId === item.work.deviceId && entry.vni === outer.vni && entry.localVtep === outer.outerDestinationVtep && entry.mode === outer.mode && entry.status === "up");
             if (local) {
-                evidence(item.stateId, "VXLAN", local.row, `终结 ${outer.mode.toUpperCase()}VNI ${outer.vni}`);
+                evidence(item.stateId, "VXLAN", local.row, `终结 ${outer.mode.toUpperCase()}VNI ${outer.vni}`, local.sourceFile);
                 publicState.kind = "decapsulate";
                 publicState.summary = `${outer.outerDestinationVtep} 解封装 ${outer.mode.toUpperCase()}VNI ${outer.vni}`;
                 packetAtDevice = { ...packetAtDevice, vxlan: undefined, vrf: local.mode === "l3" ? local.tenantVrf : packetAtDevice.vrf, vlan: local.mode === "l2" ? local.vlan : undefined };
@@ -282,7 +306,7 @@ export function traceForwarding(topologyId, snapshotId, topology, data, request)
                         const arp = data.arpEntries.find((entry) => entry.deviceId === item.work.deviceId && entry.ip === packetAtDevice.innerDestinationIp && entry.status !== "incomplete");
                         destinationMac = arp?.mac;
                         if (arp)
-                            evidence(item.stateId, "ARP表", arp.row, `${arp.ip} 解析为 ${arp.mac}`);
+                            evidence(item.stateId, "ARP表", arp.row, `${arp.ip} 解析为 ${arp.mac}`, arp.sourceFile);
                     }
                     if (!destinationMac || local.vlan === undefined)
                         terminate(item.stateId, item.work.deviceId, destinationMac ? "NO_VXLAN" : "NO_ARP", destinationMac ? "L2VNI 缺少 VLAN 映射" : `解封装后缺少 ${packetAtDevice.innerDestinationIp} 的 ARP`);
@@ -301,12 +325,40 @@ export function traceForwarding(topologyId, snapshotId, topology, data, request)
                 continue;
             }
         }
-        const localAddress = nodeById.get(item.work.deviceId)?.interfaces.some((networkInterface) => networkInterface.addresses.some((address) => address.cidr.split("/")[0] === packetAtDevice.innerDestinationIp));
+        const currentNode = nodeById.get(item.work.deviceId);
+        const localAddress = currentNode?.interfaces.some((networkInterface) => networkInterface.addresses.some((address) => address.cidr.split("/")[0] === packetAtDevice.innerDestinationIp));
         if (localAddress) {
             terminate(item.stateId, item.work.deviceId, "DELIVERED", `目的地址 ${packetAtDevice.innerDestinationIp} 已到达 ${publicState.deviceName}`);
             continue;
         }
+        const hasForwardingState = data.interfaces.some((entry) => entry.deviceId === item.work.deviceId)
+            || data.routes.some((entry) => entry.deviceId === item.work.deviceId)
+            || data.macEntries.some((entry) => entry.deviceId === item.work.deviceId)
+            || data.vxlanEntries.some((entry) => entry.deviceId === item.work.deviceId);
+        if (currentNode?.kind === "external" && destinationMac && !hasForwardingState) {
+            terminate(item.stateId, item.work.deviceId, "DELIVERED", `目的 MAC ${destinationMac} 已从 ${item.work.ingressInterface ?? "外部端口"} 到达 ${publicState.deviceName}`);
+            continue;
+        }
         const vrf = packetAtDevice.vrf ?? DEFAULT_VRF;
+        if (packetAtDevice.vlan !== undefined) {
+            let bridgeMac = destinationMac;
+            if (!bridgeMac) {
+                const arp = data.arpEntries.find((entry) => {
+                    if (entry.deviceId !== item.work.deviceId || norm(entry.vrf) !== norm(vrf) || entry.ip !== packetAtDevice.innerDestinationIp || entry.status === "incomplete")
+                        return false;
+                    const arpInterface = interfaceAttribute(item.work.deviceId, entry.interfaceName);
+                    return arpInterface?.vlan === packetAtDevice.vlan;
+                });
+                if (arp) {
+                    bridgeMac = arp.mac;
+                    evidence(item.stateId, "ARP表", arp.row, `${arp.ip} 在 VRF ${arp.vrf} / VLAN ${packetAtDevice.vlan} 解析为 ${arp.mac}`, arp.sourceFile);
+                }
+            }
+            if (bridgeMac) {
+                forwardMac({ ...item, work: { ...item.work, packet: packetAtDevice, destinationMac: bridgeMac } }, bridgeMac, packetAtDevice.vlan, packetAtDevice);
+                continue;
+            }
+        }
         const routes = routeCandidates(data, item.work.deviceId, vrf, packetAtDevice.innerDestinationIp);
         if (routes.length === 0) {
             const nodeRoutes = data.routes.some((route) => route.deviceId === item.work.deviceId);
@@ -325,10 +377,20 @@ export function traceForwarding(topologyId, snapshotId, topology, data, request)
             }
             continue;
         }
-        publicState.kind = "lookup";
+        if (publicState.kind !== "decapsulate")
+            publicState.kind = "lookup";
         for (const route of routes)
             forwardRoute(item, route, packetAtDevice, destinationMac, false);
     }
-    return { snapshotId, topologyId, source: request, states, transitions, endpoints, rootStateId, createdAt: new Date().toISOString() };
+    return {
+        snapshotId,
+        topologyId,
+        source: { ...request, sourceInterface: sourceContext?.name ?? request.sourceInterface, vrf: sourceContext?.vrf ?? request.vrf },
+        states,
+        transitions,
+        endpoints,
+        rootStateId,
+        createdAt: new Date().toISOString(),
+    };
 }
 //# sourceMappingURL=forwardingEngine.js.map

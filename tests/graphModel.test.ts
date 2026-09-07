@@ -113,4 +113,27 @@ describe("graph model", () => {
     expect(revealed.nodes.some((node) => node.id === server.id)).toBe(true);
     expect(revealed.edges.some((edge) => edge.members.some((link) => link.id === "ib-3"))).toBe(true);
   });
+
+  it("does not reveal unrelated links of a passively displayed device", () => {
+    const secondSwitch: TopologySnapshot["nodes"][number] = {
+      id: "device:second", kind: "configured", hostname: "MDC-POD1-ASW-002", label: "POD1-ASW-002", role: "ASW", pod: "POD1", interfaces: [],
+    };
+    const sharedServer: TopologySnapshot["nodes"][number] = {
+      id: "external:shared", kind: "external", hostname: "POD1-GPU-010", label: "GPU-010", role: "ENDPOINT", pod: "POD1", endpointType: "GPU", interfaces: [],
+    };
+    const multiHomed: TopologySnapshot = {
+      ...snapshot,
+      nodes: [...snapshot.nodes, secondSwitch, sharedServer],
+      links: [
+        ...snapshot.links,
+        { id: "selected-to-server", source: "device:a", target: sharedServer.id, sourceInterface: "swp10", targetInterface: "eth0", plane: "production", confidence: "declared", reciprocal: false },
+        { id: "other-to-server", source: secondSwitch.id, target: sharedServer.id, sourceInterface: "swp10", targetInterface: "eth1", plane: "production", confidence: "declared", reciprocal: false },
+      ],
+    };
+
+    const model = buildGraphModel(multiHomed, filters("", new Set(["device:a"])));
+    expect(model.nodes.some((node) => node.id === sharedServer.id)).toBe(true);
+    expect(model.edges.some((edge) => edge.members.some((link) => link.id === "selected-to-server"))).toBe(true);
+    expect(model.edges.some((edge) => edge.members.some((link) => link.id === "other-to-server"))).toBe(false);
+  });
 });

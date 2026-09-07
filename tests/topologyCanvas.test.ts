@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { alignedNodePosition, packetPosition, selectionRectanglesIntersect, viewportUpdateMode } from "../src/TopologyCanvas";
+import { alignedNodePosition, packetPosition, selectionRectanglesIntersect, simulationDeviceLabel, simulationDevicePosition, viewportUpdateMode } from "../src/TopologyCanvas";
 
 describe("topology canvas viewport", () => {
   it("fits only on the first model and preserves the viewport afterwards", () => {
@@ -23,5 +23,11 @@ describe("topology canvas viewport", () => {
   it("recomputes packet positions from the latest dragged endpoints", () => {
     expect(packetPosition({ x: 0, y: 0 }, { x: 100, y: 40 }, 0.25)).toEqual({ x: 25, y: 10 });
     expect(packetPosition({ x: 80, y: 20 }, { x: 200, y: 100 }, 0.25)).toEqual({ x: 110, y: 40 });
+  });
+
+  it("keeps a manually dragged simulation device position and renders its source IP", () => {
+    expect(simulationDevicePosition({ x: 100, y: 100 })).toEqual({ x: 172, y: 52 });
+    expect(simulationDevicePosition({ x: 200, y: 200 }, { x: 31, y: 47 })).toEqual({ x: 31, y: 47 });
+    expect(simulationDeviceLabel("10.20.30.40")).toBe("模拟设备\n10.20.30.40");
   });
 });

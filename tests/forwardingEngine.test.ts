@@ -34,6 +34,104 @@ function data(overrides: Partial<ForwardingSnapshotData> = {}): ForwardingSnapsh
 }
 
 describe("abstract forwarding engine", () => {
+  it("injects an unassigned source address through the explicitly selected port and VRF", () => {
+    const graph = topology(
+      [
+        node("a", [networkInterface("access0"), networkInterface("p1")]),
+        node("b", [networkInterface("p1"), networkInterface("lo", "10.9.0.1/32")]),
+      ],
+      [link("ab", "a", "p1", "b", "p1")],
+    );
+    const table = data({
+      interfaces: [
+        forwardingInterface("a", "access0", { forwardingMode: "access", vrf: "blue", vlan: 100 }),
+        forwardingInterface("a", "p1", { vrf: "blue" }),
+      ],
+      routes: [
+        { row: 2, deviceId: "a", deviceName: "A", vrf: "blue", destinationCidr: "10.9.0.1/32", action: "connected", outputInterface: "p1" },
+      ],
+      arpEntries: [
+        { row: 2, deviceId: "a", deviceName: "A", vrf: "blue", ip: "10.9.0.1", mac: "00:00:00:00:00:09", interfaceName: "p1", status: "reachable" },
+      ],
+    });
+
+    const result = traceForwarding("topology", "snapshot", graph, table, {
+      sourceDeviceId: "a",
+      sourceIp: "198.51.100.10",
+      destinationIp: "10.9.0.1",
+      sourceInterface: "access0",
+      vrf: "blue",
+    });
+
+    expect(result.states[0]).toMatchObject({ ingressInterface: "access0" });
+    expect(result.transitions.map((item) => item.topologyLinkId)).toEqual(["ab"]);
+    expect(result.endpoints.at(-1)?.code).toBe("DELIVERED");
+  });
+
+  it("requires an injection port when the source address is not assigned to the device", () => {
+    const graph = topology([node("a", [networkInterface("p1"), networkInterface("p2")])], []);
+    const table = data({ interfaces: [forwardingInterface("a", "p1"), forwardingInterface("a", "p2")] });
+
+    const result = traceForwarding("topology", "snapshot", graph, table, {
+      sourceDeviceId: "a",
+      sourceIp: "198.51.100.10",
+      destinationIp: "203.0.113.9",
+    });
+
+    expect(result.endpoints).toEqual([expect.objectContaining({ code: "INVALID_STATE", message: "源地址不属于设备接口，请指定流量注入端口" })]);
+  });
+
+  it("derives the tenant VRF from an access-port VLAN and bridges a known neighbor through its L2VNI", () => {
+    const graph = topology(
+      [
+        node("leaf1", [networkInterface("bond127"), networkInterface("p1")]),
+        node("leaf2", [networkInterface("p1"), networkInterface("p2")]),
+        { ...node("host", [networkInterface("eth0")]), kind: "external", role: "ENDPOINT" },
+      ],
+      [link("fabric", "leaf1", "p1", "leaf2", "p1"), link("access", "leaf2", "p2", "host", "eth0")],
+    );
+    const table = data({
+      interfaces: [
+        forwardingInterface("leaf1", "bond127", { interfaceType: "lag", forwardingMode: "access", vrf: "default", vlan: 1000 }),
+        forwardingInterface("leaf1", "vlan1000", { interfaceType: "svi", vrf: "magaspeed", vlan: 1000 }),
+        forwardingInterface("leaf1", "p1", { vrf: "default" }),
+        forwardingInterface("leaf2", "p1", { vrf: "default" }),
+        forwardingInterface("leaf2", "p2", { forwardingMode: "access", vrf: "default", vlan: 1000 }),
+        forwardingInterface("leaf2", "vlan1000", { interfaceType: "svi", vrf: "magaspeed", vlan: 1000 }),
+      ],
+      routes: [
+        { row: 2, deviceId: "leaf1", deviceName: "LEAF1", vrf: "default", destinationCidr: "10.240.255.3/32", action: "forward", nextHop: "192.0.2.3", outputInterface: "p1" },
+      ],
+      arpEntries: [
+        { row: 2, deviceId: "leaf1", deviceName: "LEAF1", vrf: "magaspeed", ip: "10.240.0.129", mac: "58:a2:e1:dd:e9:da", interfaceName: "vlan1000", status: "reachable" },
+        { row: 3, deviceId: "leaf1", deviceName: "LEAF1", vrf: "magaspeed", ip: "10.240.2.74", mac: "58:a2:e1:76:7c:20", interfaceName: "vlan1000", status: "stale" },
+        { row: 4, deviceId: "leaf1", deviceName: "LEAF1", vrf: "default", ip: "192.0.2.3", mac: "00:aa:00:00:00:03", interfaceName: "p1", status: "reachable" },
+      ],
+      macEntries: [
+        { row: 2, deviceId: "leaf1", deviceName: "LEAF1", vlan: 1000, mac: "58:a2:e1:76:7c:20", action: "remote", vni: 1001000, remoteVtep: "10.240.255.3" },
+        { row: 3, deviceId: "leaf2", deviceName: "LEAF2", vlan: 1000, mac: "58:a2:e1:76:7c:20", action: "interface", outputInterface: "p2" },
+      ],
+      vxlanEntries: [
+        { row: 2, deviceId: "leaf1", deviceName: "LEAF1", vni: 1001000, mode: "l2", localVtep: "10.240.255.1", vlan: 1000, tenantVrf: "magaspeed", underlayVrf: "default", udpDestinationPort: 4789, status: "up" },
+        { row: 3, deviceId: "leaf2", deviceName: "LEAF2", vni: 1001000, mode: "l2", localVtep: "10.240.255.3", vlan: 1000, tenantVrf: "magaspeed", underlayVrf: "default", udpDestinationPort: 4789, status: "up" },
+      ],
+    });
+
+    const result = traceForwarding("topology", "snapshot", graph, table, {
+      sourceDeviceId: "leaf1",
+      sourceIp: "10.240.0.129",
+      destinationIp: "10.240.2.74",
+      sourceInterface: "bond127",
+      vrf: "default",
+    });
+
+    expect(result.source).toMatchObject({ sourceInterface: "bond127", vrf: "magaspeed" });
+    expect(result.states[0]).toMatchObject({ ingressInterface: "bond127", packet: { vrf: "magaspeed", vlan: 1000 } });
+    expect(result.states[0].evidence).toEqual(expect.arrayContaining([expect.objectContaining({ sheet: "ARP表", row: 3 })]));
+    expect(result.transitions.map((item) => item.topologyLinkId)).toEqual(["fabric", "access"]);
+    expect(result.endpoints.at(-1)?.code).toBe("DELIVERED");
+  });
+
   it("uses longest-prefix forwarding and expands every route in one ECMP group", () => {
     const graph = topology(
       [
@@ -119,6 +217,73 @@ describe("abstract forwarding engine", () => {
     expect(result.states.some((item) => item.packet.vxlan?.vni === 10100 && item.packet.innerSourceIp === "10.1.0.1")).toBe(true);
     expect(result.states.some((item) => item.kind === "decapsulate")).toBe(true);
     expect(result.endpoints.at(-1)?.code).toBe("DELIVERED");
+  });
+
+  it("uses the actual local VXLAN mode when a remote MAC points to an L3VNI", () => {
+    const graph = topology(
+      [
+        node("leaf1", [networkInterface("lo", "10.1.0.1/32"), networkInterface("svi4058"), networkInterface("p1")]),
+        node("leaf2", [networkInterface("lo", "172.16.0.2/32"), networkInterface("p1"), networkInterface("p2")]),
+        node("host", [networkInterface("eth0", "10.20.0.8/24")]),
+      ],
+      [link("fabric", "leaf1", "p1", "leaf2", "p1"), link("access", "leaf2", "p2", "host", "eth0")],
+    );
+    const table = data({
+      interfaces: [
+        forwardingInterface("leaf1", "svi4058", { interfaceType: "svi", forwardingMode: "access", vrf: "blue", vlan: 4058 }),
+        forwardingInterface("leaf1", "p1", { vrf: "underlay" }),
+        forwardingInterface("leaf2", "p2", { vrf: "blue" }),
+      ],
+      routes: [
+        { row: 2, deviceId: "leaf1", deviceName: "LEAF1", vrf: "blue", destinationCidr: "10.20.0.0/24", action: "connected", outputInterface: "svi4058" },
+        { row: 3, deviceId: "leaf1", deviceName: "LEAF1", vrf: "underlay", destinationCidr: "172.16.0.2/32", action: "forward", nextHop: "192.0.2.2", outputInterface: "p1" },
+        { row: 4, deviceId: "leaf2", deviceName: "LEAF2", vrf: "blue", destinationCidr: "10.20.0.0/24", action: "connected", outputInterface: "p2" },
+      ],
+      arpEntries: [
+        { row: 2, deviceId: "leaf1", deviceName: "LEAF1", vrf: "blue", ip: "10.20.0.8", mac: "9c:05:91:f2:dc:fd", interfaceName: "svi4058", status: "reachable" },
+        { row: 3, deviceId: "leaf1", deviceName: "LEAF1", vrf: "underlay", ip: "192.0.2.2", mac: "00:aa:00:00:00:02", interfaceName: "p1", status: "reachable" },
+        { row: 4, deviceId: "leaf2", deviceName: "LEAF2", vrf: "blue", ip: "10.20.0.8", mac: "9c:05:91:f2:dc:fd", interfaceName: "p2", status: "reachable" },
+      ],
+      macEntries: [
+        { row: 2, deviceId: "leaf1", deviceName: "LEAF1", vlan: 4058, mac: "9c:05:91:f2:dc:fd", action: "remote", vni: 4001, remoteVtep: "172.16.0.2" },
+      ],
+      vxlanEntries: [
+        { row: 2, deviceId: "leaf1", deviceName: "LEAF1", vni: 4001, mode: "l3", localVtep: "172.16.0.1", vlan: 4058, tenantVrf: "blue", underlayVrf: "underlay", udpDestinationPort: 4789, status: "up" },
+        { row: 3, deviceId: "leaf2", deviceName: "LEAF2", vni: 4001, mode: "l3", localVtep: "172.16.0.2", vlan: 589, tenantVrf: "blue", underlayVrf: "underlay", udpDestinationPort: 4789, status: "up" },
+      ],
+    });
+
+    const result = traceForwarding("topology", "snapshot", graph, table, { sourceDeviceId: "leaf1", sourceIp: "10.1.0.1", destinationIp: "10.20.0.8", vrf: "blue" });
+
+    expect(result.transitions.map((item) => item.topologyLinkId)).toEqual(["fabric", "access"]);
+    expect(result.states.some((item) => item.kind === "encapsulate" && item.packet.vxlan?.mode === "l3" && item.packet.vxlan.vni === 4001)).toBe(true);
+    expect(result.states.find((item) => item.deviceId === "leaf2")).toMatchObject({ kind: "decapsulate" });
+    expect(result.endpoints.at(-1)?.code).toBe("DELIVERED");
+  });
+
+  it("defers a missing remote-MAC VXLAN mapping to an explicit trace termination", () => {
+    const graph = topology([
+      node("leaf1", [networkInterface("lo", "10.1.0.1/32"), networkInterface("svi4058")]),
+    ], []);
+    const table = data({
+      interfaces: [
+        forwardingInterface("leaf1", "svi4058", { interfaceType: "svi", forwardingMode: "access", vrf: "blue", vlan: 4058 }),
+      ],
+      routes: [
+        { row: 2, deviceId: "leaf1", deviceName: "LEAF1", vrf: "blue", destinationCidr: "10.20.0.0/24", action: "connected", outputInterface: "svi4058" },
+      ],
+      arpEntries: [
+        { row: 2, deviceId: "leaf1", deviceName: "LEAF1", vrf: "blue", ip: "10.20.0.8", mac: "9c:05:91:f2:dc:fe", interfaceName: "svi4058", status: "reachable" },
+      ],
+      macEntries: [
+        { row: 2, deviceId: "leaf1", deviceName: "LEAF1", vlan: 4058, mac: "9c:05:91:f2:dc:fe", action: "remote", vni: 4999, remoteVtep: "172.16.0.2" },
+      ],
+    });
+
+    const result = traceForwarding("topology", "snapshot", graph, table, { sourceDeviceId: "leaf1", sourceIp: "10.1.0.1", destinationIp: "10.20.0.8", vrf: "blue" });
+
+    expect(result.transitions).toHaveLength(0);
+    expect(result.endpoints).toEqual([expect.objectContaining({ code: "NO_VXLAN", message: "缺少 VNI 4999 对应的本地 VXLAN 映射" })]);
   });
 
   it("performs symmetric L3VNI decapsulation and resumes lookup in the tenant VRF", () => {

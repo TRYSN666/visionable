@@ -2,11 +2,11 @@ import { randomUUID } from "node:crypto";
 import type { ForwardingSnapshotSummary, ForwardingTraceRequest, ForwardingTraceResult } from "../shared/forwarding.js";
 import type { InterfaceRecord, TopologyPosition, TopologyProject, TopologySnapshot } from "../shared/topology.js";
 import { traceForwarding } from "./forwardingEngine.js";
-import { parseForwardingWorkbook } from "./forwardingWorkbookParser.js";
+import { parseForwardingWorkbook, parseForwardingWorkbooks, type ForwardingWorkbookInput } from "./forwardingWorkbookParser.js";
 import { applyServerInventory, loadServerInventory } from "./inventory.js";
 import { parseConfigDirectory } from "./parser.js";
 import { inferImportedRole, parsePortsCsv, parsePortsXlsx } from "./portsCsvParser.js";
-import { ServerAddressStore } from "./serverAddressStore.js";
+import { ServerAddressStore, type InstalledTopologyInterface } from "./serverAddressStore.js";
 import { topologyStructureFingerprint } from "./topologyFingerprint.js";
 
 export class ServerNodeNotFoundError extends Error {}
@@ -51,6 +51,59 @@ function normalizeImportedSnapshot(snapshot: TopologySnapshot): TopologySnapshot
   };
 }
 
+function interfaceInstallations(data: import("../shared/forwarding.js").ForwardingSnapshotData): InstalledTopologyInterface[] {
+  const aggregates = new Set(data.lagMembers.map((item) => `${item.deviceId}\0${item.aggregateInterface.toLowerCase()}`));
+  const byKey = new Map<string, InstalledTopologyInterface>();
+  const add = (deviceId: string, interfaceName: string | undefined, logical = false) => {
+    if (!interfaceName) return;
+    const key = `${deviceId}\0${interfaceName.toLowerCase()}`;
+    const current = byKey.get(key);
+    byKey.set(key, { deviceId, interfaceName: current?.interfaceName ?? interfaceName, logical: current?.logical === true || logical });
+  };
+  for (const item of data.interfaces) add(item.deviceId, item.interfaceName, item.interfaceType !== "physical");
+  for (const item of data.lagMembers) {
+    add(item.deviceId, item.aggregateInterface, true);
+    add(item.deviceId, item.memberInterface, false);
+  }
+  for (const item of data.routes) add(item.deviceId, item.outputInterface, aggregates.has(`${item.deviceId}\0${item.outputInterface?.toLowerCase()}`));
+  for (const item of data.arpEntries) add(item.deviceId, item.interfaceName, aggregates.has(`${item.deviceId}\0${item.interfaceName.toLowerCase()}`));
+  for (const item of data.macEntries) add(item.deviceId, item.outputInterface, aggregates.has(`${item.deviceId}\0${item.outputInterface?.toLowerCase()}`));
+  return [...byKey.values()];
+}
+
+function applyInstalledInterfaces(snapshot: TopologySnapshot, installed: InstalledTopologyInterface[]): TopologySnapshot {
+  if (installed.length === 0) return snapshot;
+  const requested = new Map<string, InstalledTopologyInterface[]>();
+  for (const item of installed) requested.set(item.deviceId, [...(requested.get(item.deviceId) ?? []), item]);
+  let added = 0;
+  const nodes = snapshot.nodes.map((node) => {
+    const additions = requested.get(node.id);
+    if (!additions) return node;
+    const existing = new Set(node.interfaces.map((item) => item.name.toLowerCase()));
+    const interfaces = [...node.interfaces];
+    for (const item of additions) {
+      if (existing.has(item.interfaceName.toLowerCase())) continue;
+      const peers = snapshot.links.flatMap((link) => {
+        if (link.source === node.id && link.sourceInterface.toLowerCase() === item.interfaceName.toLowerCase()) {
+          const peer = snapshot.nodes.find((candidate) => candidate.id === link.target);
+          return [{ device: peer?.hostname ?? link.target, interface: link.targetInterface, bandwidth: link.bandwidth }];
+        }
+        if (link.target === node.id && link.targetInterface.toLowerCase() === item.interfaceName.toLowerCase()) {
+          const peer = snapshot.nodes.find((candidate) => candidate.id === link.source);
+          return [{ device: peer?.hostname ?? link.source, interface: link.sourceInterface, bandwidth: link.bandwidth }];
+        }
+        return [];
+      });
+      interfaces.push({ name: item.interfaceName, addresses: [], logical: item.logical || undefined, peers });
+      existing.add(item.interfaceName.toLowerCase());
+      added += 1;
+    }
+    return interfaces.length === node.interfaces.length ? node : { ...node, interfaces };
+  });
+  if (added === 0) return snapshot;
+  return { ...snapshot, nodes, stats: { ...snapshot.stats, usedInterfaces: snapshot.stats.usedInterfaces + added } };
+}
+
 export class TopologyStore {
   readonly configDir: string;
   private snapshot?: TopologySnapshot;
@@ -85,7 +138,7 @@ export class TopologyStore {
         const layoutPositions = Object.fromEntries(
           Object.entries(this.addressStore.layoutPositions("metta-roce")).filter(([id]) => validLayoutIds.has(id)),
         );
-        const snapshot = { ...enrichedSnapshot, layoutPositions };
+        const snapshot = applyInstalledInterfaces({ ...enrichedSnapshot, layoutPositions }, this.addressStore.installedTopologyInterfaces("metta-roce"));
         this.addressStore.ensureDefaultCatalog(snapshot.nodes.length, snapshot.links.length);
         this.snapshot = snapshot;
         this.lastError = undefined;
@@ -175,7 +228,7 @@ export class TopologyStore {
     if (!summary) throw new CatalogNotFoundError("拓扑不存在");
     if (summary.sourceType === "nvue") {
       if (!this.snapshot) throw new Error("拓扑尚未加载");
-      return this.snapshot;
+      return applyInstalledInterfaces(this.snapshot, this.addressStore.installedTopologyInterfaces(topologyId));
     }
     const stored = this.addressStore.importedTopology(projectId, topologyId);
     if (!stored) throw new CatalogNotFoundError("拓扑数据不存在");
@@ -183,7 +236,7 @@ export class TopologyStore {
     const layoutPositions = Object.fromEntries(
       Object.entries(this.addressStore.layoutPositions(topologyId)).filter(([id]) => validIds.has(id)),
     );
-    return normalizeImportedSnapshot({ ...stored, layoutPositions });
+    return applyInstalledInterfaces(normalizeImportedSnapshot({ ...stored, layoutPositions }), this.addressStore.installedTopologyInterfaces(topologyId));
   }
 
   async saveTopologyLayout(projectId: string, topologyId: string, positions: Record<string, TopologyPosition>): Promise<TopologySnapshot> {
@@ -203,12 +256,33 @@ export class TopologyStore {
   async importForwardingSnapshot(projectId: string, topologyId: string, xlsxBytes: Buffer): Promise<ForwardingSnapshotSummary> {
     const topology = this.topology(projectId, topologyId);
     const data = await parseForwardingWorkbook(xlsxBytes, topology);
-    return this.addressStore.saveForwardingSnapshot(topologyId, topologyStructureFingerprint(topology), data);
+    const installations = interfaceInstallations(data);
+    const updatedTopology = applyInstalledInterfaces(topology, installations);
+    const summary = this.addressStore.saveForwardingSnapshot(topologyId, topologyStructureFingerprint(updatedTopology), data, installations);
+    if (topologyId === "metta-roce") this.snapshot = updatedTopology;
+    return summary;
+  }
+
+  async importForwardingSnapshotBatch(projectId: string, topologyId: string, workbooks: ForwardingWorkbookInput[]): Promise<ForwardingSnapshotSummary> {
+    const topology = this.topology(projectId, topologyId);
+    const data = await parseForwardingWorkbooks(workbooks, topology);
+    const installations = interfaceInstallations(data);
+    const updatedTopology = applyInstalledInterfaces(topology, installations);
+    const summary = this.addressStore.saveForwardingSnapshot(topologyId, topologyStructureFingerprint(updatedTopology), data, installations);
+    if (topologyId === "metta-roce") this.snapshot = updatedTopology;
+    return summary;
   }
 
   forwardingSnapshots(projectId: string, topologyId: string): ForwardingSnapshotSummary[] {
     const topology = this.topology(projectId, topologyId);
     return this.addressStore.listForwardingSnapshots(topologyId, topologyStructureFingerprint(topology));
+  }
+
+  forwardingSnapshotData(projectId: string, topologyId: string, snapshotId: string): import("../shared/forwarding.js").ForwardingSnapshotData {
+    this.topology(projectId, topologyId);
+    const data = this.addressStore.forwardingSnapshot(topologyId, snapshotId);
+    if (!data) throw new ForwardingSnapshotNotFoundError("转发表快照不存在或不属于当前拓扑");
+    return data;
   }
 
   traceForwarding(projectId: string, topologyId: string, snapshotId: string, request: ForwardingTraceRequest): ForwardingTraceResult {

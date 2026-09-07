@@ -211,6 +211,8 @@ export function buildGraphModel(snapshot: TopologySnapshot, filters: GraphFilter
       )
       .map((node) => node.id),
   );
+  const passivelyRevealedServerIds = new Set<string>();
+  const passiveServerLinkIds = new Set<string>();
   for (const link of snapshot.links) {
     const candidateId = selectedSwitchIds.has(link.source)
       ? link.target
@@ -219,7 +221,11 @@ export function buildGraphModel(snapshot: TopologySnapshot, filters: GraphFilter
         : undefined;
     const candidate = candidateId ? nodeById.get(candidateId) : undefined;
     if (!candidate || !isDeferredServer(candidate)) continue;
-    if (allowed(candidate, filters)) visibleServerIds.add(candidate.id);
+    if (allowed(candidate, filters)) {
+      if (!visibleServerIds.has(candidate.id)) passivelyRevealedServerIds.add(candidate.id);
+      if (passivelyRevealedServerIds.has(candidate.id)) passiveServerLinkIds.add(link.id);
+      visibleServerIds.add(candidate.id);
+    }
   }
 
   for (const nodeId of visibleServerIds) {
@@ -264,6 +270,7 @@ export function buildGraphModel(snapshot: TopologySnapshot, filters: GraphFilter
   const aggregated = new Map<string, GraphEdgeData>();
   for (const link of snapshot.links) {
     if (!filters.planes.has(link.plane)) continue;
+    if ((passivelyRevealedServerIds.has(link.source) || passivelyRevealedServerIds.has(link.target)) && !passiveServerLinkIds.has(link.id)) continue;
     const source = displayId(link.source);
     const target = displayId(link.target);
     if (!source || !target || source === target) continue;
